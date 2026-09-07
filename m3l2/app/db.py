@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, create_engine, text
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, create_engine, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from sqlalchemy.types import JSON
@@ -122,6 +122,7 @@ class SiteSnapshot(Base):
     efficiency: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     status: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     source: Mapped[str] = mapped_column(String, nullable=False)
+    submitted_by_email: Mapped[str | None] = mapped_column(String, nullable=True)
     quality: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     raw_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
@@ -204,7 +205,17 @@ def configure_database(database_url: str) -> Engine:
 
 
 def create_tables() -> None:
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)
+    _ensure_site_snapshot_columns(engine)
+
+
+def _ensure_site_snapshot_columns(engine: Engine) -> None:
+    columns = {column["name"] for column in inspect(engine).get_columns("site_snapshots")}
+    if "submitted_by_email" in columns:
+        return
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE site_snapshots ADD COLUMN submitted_by_email VARCHAR"))
 
 
 def db_status() -> str:

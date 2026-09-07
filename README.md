@@ -364,8 +364,46 @@ curl -X POST http://localhost/l2/sites/SLICES-GR-UTH/pull \
 Read the stored snapshot:
 
 ```bash
-curl http://localhost/l2/sites/SLICES-GR-UTH/latest
-curl http://localhost/l2/sites/SLICES-GR-UTH/availability
+curl http://localhost:8000/l2/sites/SLICES-GR-UTH/latest \
+  -H "Authorization: Bearer $TOKEN"
+curl http://localhost:8000/l2/sites/SLICES-GR-UTH/availability \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Submitted site-level snapshots store the authenticated submitter email in `site_snapshots.submitted_by_email`.
+Existing rows created before this field was added have `NULL` in that column.
+
+Check submitted snapshots in Postgres:
+
+```bash
+docker compose exec postgres psql -U m3l2 -d m3l2 \
+  -c "SELECT id, site_id, ts, source, submitted_by_email FROM site_snapshots WHERE site_id = 'SLICES-GR-UTH' ORDER BY ts DESC LIMIT 20;"
+```
+
+Submit generated mock site metrics for one year from today at hourly cadence:
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/auth/token \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "greendigit@uth.gr",
+    "password": "your-password",
+    "site_id": "SLICES-GR-UTH",
+    "role": "publisher"
+  }' | jq -r '.access_token')
+
+python3 scripts/submit_mock_site_snapshots.py \
+  --base-url http://localhost:8000 \
+  --site-id SLICES-GR-UTH \
+  --days 365 \
+  --step-minutes 60 \
+  --dry-run
+
+python3 scripts/submit_mock_site_snapshots.py \
+  --base-url http://localhost:8000 \
+  --site-id SLICES-GR-UTH \
+  --days 365 \
+  --step-minutes 60
 ```
 
 Remove those example rows:

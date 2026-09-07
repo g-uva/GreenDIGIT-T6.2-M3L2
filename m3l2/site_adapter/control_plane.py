@@ -70,6 +70,7 @@ def snapshot_to_dict(snapshot: SiteSnapshot) -> dict[str, Any]:
         "efficiency": snapshot.efficiency or {},
         "status": snapshot.status or {},
         "source": snapshot.source,
+        "submitted_by_email": snapshot.submitted_by_email,
         "quality": snapshot.quality or {},
         "raw_json": snapshot.raw_json,
     }
@@ -128,6 +129,7 @@ def store_snapshot(
     source: str,
     ts: datetime | None = None,
     raw_json: dict[str, Any] | None = None,
+    submitted_by_email: str | None = None,
 ) -> SiteSnapshot:
     snapshot = SiteSnapshot(
         site_id=site_id,
@@ -138,6 +140,7 @@ def store_snapshot(
         efficiency=jsonable_encoder(payload.get("efficiency") or {}),
         status=jsonable_encoder(payload.get("status") or {}),
         source=source,
+        submitted_by_email=submitted_by_email,
         quality=jsonable_encoder(payload.get("quality") or {}),
         raw_json=jsonable_encoder(raw_json if raw_json is not None else payload),
     )
@@ -156,6 +159,7 @@ async def pull_and_store_snapshot(
     start: datetime | None = None,
     end: datetime | None = None,
     step: str = "1h",
+    submitted_by_email: str | None = None,
 ) -> SiteSnapshot:
     try:
         pulled = await SiteAdapterClient(site.adapter_base_url).pull_snapshot(
@@ -170,7 +174,15 @@ async def pull_and_store_snapshot(
         "status": pulled.get("availability", {}),
         "quality": {"freshness": "fresh"},
     }
-    return store_snapshot(session, site.site_id, payload, source="pull", ts=utc_now(), raw_json=pulled)
+    return store_snapshot(
+        session,
+        site.site_id,
+        payload,
+        source="pull",
+        ts=utc_now(),
+        raw_json=pulled,
+        submitted_by_email=submitted_by_email,
+    )
 
 
 @router.post("/register")
@@ -210,13 +222,25 @@ def register_site(
 
 
 @router.get("")
-def list_sites(session: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    rows = session.execute(select(RegisteredSite).order_by(RegisteredSite.site_id)).scalars().all()
+def list_sites(
+    principal: SitePrincipal = Depends(require_roles("reader", "publisher", "site_admin")),
+    session: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    rows = (
+        session.execute(select(RegisteredSite).where(RegisteredSite.site_id == principal.site_id).order_by(RegisteredSite.site_id))
+        .scalars()
+        .all()
+    )
     return [_site_to_dict(row) for row in rows]
 
 
 @router.get("/{site_id}")
-def get_site(site_id: str, session: Session = Depends(get_db)) -> dict[str, Any]:
+def get_site(
+    site_id: str,
+    principal: SitePrincipal = Depends(require_roles("reader", "publisher", "site_admin")),
+    session: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_same_site(principal, site_id)
     return _site_to_dict(_load_site(session, site_id))
 
 
@@ -230,7 +254,15 @@ def push_snapshot(
     require_same_site(principal, site_id)
     _load_site(session, site_id)
     body = model_dump(payload)
-    snapshot = store_snapshot(session, site_id, body, source="push", ts=payload.ts, raw_json=body)
+    snapshot = store_snapshot(
+        session,
+        site_id,
+        body,
+        source="push",
+        ts=payload.ts,
+        raw_json=body,
+        submitted_by_email=principal.email,
+    )
     return snapshot_to_dict(snapshot)
 
 
@@ -245,7 +277,7 @@ async def pull_snapshot_endpoint(
 ) -> dict[str, Any]:
     require_same_site(principal, site_id)
     site = _load_site(session, site_id)
-    snapshot = await pull_and_store_snapshot(session, site, start=start, end=end, step=step)
+    snapshot = await pull_and_store_snapshot(session, site, start=start, end=end, step=step, submitted_by_email=principal.email)
     return snapshot_to_dict(snapshot)
 
 
@@ -253,41 +285,78 @@ async def pull_snapshot_endpoint(
 async def latest(
     site_id: str,
     refresh: bool = False,
+    principal: SitePrincipal = Depends(require_roles("reader", "site_admin")),
     session: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    require_same_site(principal, site_id)
     site = _load_site(session, site_id)
-    snapshot = await pull_and_store_snapshot(session, site) if refresh else latest_snapshot(session, site_id)
+    snapshot = (
+        await pull_and_store_snapshot(session, site, submitted_by_email=principal.email)
+        if refresh
+        else latest_snapshot(session, site_id)
+    )
     if snapshot is None:
         raise HTTPException(status_code=404, detail=f"No snapshots stored for site: {site_id}")
     return snapshot_to_dict(snapshot)
 
 
-async def _latest_section(site_id: str, section: str, refresh: bool, session: Session) -> dict[str, Any]:
+async def _latest_section(
+    site_id: str,
+    section: str,
+    refresh: bool,
+    principal: SitePrincipal,
+    session: Session,
+) -> dict[str, Any]:
+    require_same_site(principal, site_id)
     site = _load_site(session, site_id)
-    snapshot = await pull_and_store_snapshot(session, site) if refresh else latest_snapshot(session, site_id)
+    snapshot = (
+        await pull_and_store_snapshot(session, site, submitted_by_email=principal.email)
+        if refresh
+        else latest_snapshot(session, site_id)
+    )
     if snapshot is None:
         raise HTTPException(status_code=404, detail=f"No snapshots stored for site: {site_id}")
     return getattr(snapshot, section) or {}
 
 
 @router.get("/{site_id}/capabilities")
-async def get_capabilities(site_id: str, refresh: bool = False, session: Session = Depends(get_db)) -> dict[str, Any]:
-    return await _latest_section(site_id, "capabilities", refresh, session)
+async def get_capabilities(
+    site_id: str,
+    refresh: bool = False,
+    principal: SitePrincipal = Depends(require_roles("reader", "site_admin")),
+    session: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return await _latest_section(site_id, "capabilities", refresh, principal, session)
 
 
 @router.get("/{site_id}/availability")
-async def get_availability(site_id: str, refresh: bool = False, session: Session = Depends(get_db)) -> dict[str, Any]:
-    return await _latest_section(site_id, "availability", refresh, session)
+async def get_availability(
+    site_id: str,
+    refresh: bool = False,
+    principal: SitePrincipal = Depends(require_roles("reader", "site_admin")),
+    session: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return await _latest_section(site_id, "availability", refresh, principal, session)
 
 
 @router.get("/{site_id}/usage")
-async def get_usage(site_id: str, refresh: bool = False, session: Session = Depends(get_db)) -> dict[str, Any]:
-    return await _latest_section(site_id, "usage", refresh, session)
+async def get_usage(
+    site_id: str,
+    refresh: bool = False,
+    principal: SitePrincipal = Depends(require_roles("reader", "site_admin")),
+    session: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return await _latest_section(site_id, "usage", refresh, principal, session)
 
 
 @router.get("/{site_id}/efficiency")
-async def get_efficiency(site_id: str, refresh: bool = False, session: Session = Depends(get_db)) -> dict[str, Any]:
-    return await _latest_section(site_id, "efficiency", refresh, session)
+async def get_efficiency(
+    site_id: str,
+    refresh: bool = False,
+    principal: SitePrincipal = Depends(require_roles("reader", "site_admin")),
+    session: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return await _latest_section(site_id, "efficiency", refresh, principal, session)
 
 
 async def forward_workload_to_site(session: Session, site_id: str, payload: dict[str, Any]) -> dict[str, Any]:
