@@ -11,11 +11,11 @@ from sqlalchemy.orm import Session
 
 from m3l2.app.config import get_settings
 from m3l2.app.db import ExecutionRecord, RegisteredSite, SessionLocal, SiteSnapshot, utc_now
-from m3l2.site_adapter.auth import SitePrincipal, require_roles, require_same_site
+from m3l2.site_adapter.auth import SitePrincipal, current_principal, require_roles, require_same_site
 from m3l2.site_adapter.client import SiteAdapterClient
 from m3l2.site_adapter.schemas import SiteRegistrationRequest, SiteSnapshotIn, WorkloadSubmissionRequest
 
-router = APIRouter(prefix="/l2/sites", tags=["l2-site-adapter"])
+router = APIRouter(prefix="/l2/sites", tags=["l2-site-adapter"], dependencies=[Depends(current_principal)])
 
 
 def get_db() -> Session:

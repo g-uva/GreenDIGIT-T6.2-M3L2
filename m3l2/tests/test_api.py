@@ -43,6 +43,7 @@ def _seed_site() -> None:
             SiteSnapshot(
                 site_id="SLICES-GR-UTH",
                 ts=datetime(2026, 6, 30, tzinfo=timezone.utc),
+                capabilities={"max_cpu": 32},
                 availability={"status": "up"},
                 usage={"cpu_utilization": 0.42},
                 efficiency={"energy_per_cpu_hour_wh": 120.0},
@@ -59,15 +60,44 @@ def _auth_header(email: str = "reader@uth.gr", site_id: str = "SLICES-GR-UTH", r
     return {"Authorization": f"Bearer {token}"}
 
 
-def test_l2_site_reads_require_bearer_token(temp_database, monkeypatch):
+def test_l2_site_adapter_endpoints_require_bearer_token(temp_database, monkeypatch):
     monkeypatch.setenv("JWT_SECRET", "test-secret")
     _seed_site()
 
+    snapshot_payload = {
+        "ts": "2026-09-07T00:00:00Z",
+        "availability": {"status": "up"},
+    }
+    register_payload = {
+        "site_id": "SLICES-GR-UTH",
+        "site_name": "SLICES-GR-UTH",
+        "ri_type": "grid",
+        "adapter_base_url": "http://127.0.0.1:8000/mock-l3/sites/SLICES-GR-UTH",
+        "contact_email": "reader@uth.gr",
+    }
+    workload_payload = {
+        "workload_id": "workload-1",
+        "workload_type": "batch",
+        "requirements": {},
+        "metadata": {},
+    }
+
     with TestClient(app) as client:
-        assert client.get("/l2/sites").status_code == 401
-        assert client.get("/l2/sites/SLICES-GR-UTH").status_code == 401
-        assert client.get("/l2/sites/SLICES-GR-UTH/latest").status_code == 401
-        assert client.get("/l2/sites/SLICES-GR-UTH/availability").status_code == 401
+        checks = [
+            client.get("/l2/sites"),
+            client.get("/l2/sites/SLICES-GR-UTH"),
+            client.get("/l2/sites/SLICES-GR-UTH/latest"),
+            client.get("/l2/sites/SLICES-GR-UTH/capabilities"),
+            client.get("/l2/sites/SLICES-GR-UTH/availability"),
+            client.get("/l2/sites/SLICES-GR-UTH/usage"),
+            client.get("/l2/sites/SLICES-GR-UTH/efficiency"),
+            client.post("/l2/sites/SLICES-GR-UTH/pull"),
+            client.post("/l2/sites/SLICES-GR-UTH/snapshots", json=snapshot_payload),
+            client.post("/l2/sites/SLICES-GR-UTH/submit-workload", json=workload_payload),
+            client.post("/l2/sites/register", json=register_payload),
+        ]
+
+    assert {response.status_code for response in checks} == {401}
 
 
 def test_l2_site_reads_return_authenticated_site_data(temp_database, monkeypatch):
