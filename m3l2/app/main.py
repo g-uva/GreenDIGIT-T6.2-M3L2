@@ -25,10 +25,11 @@ from m3l2.app.db import (
     create_tables,
     utc_now,
 )
-from m3l2.app.schemas import IngestRunRequest, PredictRequest
+from m3l2.app.schemas import IngestRunRequest, PredictRequest, PredictionResponse
 from m3l2.auth.router import router as auth_router
 from m3l2.broker_mock.router import router as mock_broker_router
-from m3l2.inference.predict import predict as run_predict
+from m3l2.inference.forecast_refresh import refresh_forecasts
+from m3l2.inference.predict import predict as run_predict, predict_many
 from m3l2.ingestion.jobs import run_ingestion
 from m3l2.ingestion.site_adapter import normalise_site_profile, normalise_site_status
 from m3l2.site_adapter.control_plane import router as site_adapter_router
@@ -79,6 +80,15 @@ def _scheduled_cycle() -> None:
         logger.exception("Scheduled M3L2 cycle failed")
 
 
+def _scheduled_forecast_refresh() -> None:
+    logger.info("Starting scheduled M3L2 forecast refresh")
+    try:
+        summary = refresh_forecasts(force=True)
+        logger.info("Scheduled M3L2 forecast refresh completed: %s", summary)
+    except Exception:
+        logger.exception("Scheduled M3L2 forecast refresh failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global scheduler
@@ -95,8 +105,21 @@ async def lifespan(app: FastAPI):
             coalesce=True,
             replace_existing=True,
         )
+        scheduler.add_job(
+            _scheduled_forecast_refresh,
+            "interval",
+            minutes=settings.forecast_refresh_minutes,
+            id="m3l2_forecast_refresh",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+        )
         scheduler.start()
-        logger.info("Started M3L2 scheduler with %sh interval", settings.train_interval_hours)
+        logger.info(
+            "Started M3L2 scheduler with %sh training interval and %sm forecast refresh interval",
+            settings.train_interval_hours,
+            settings.forecast_refresh_minutes,
+        )
     yield
     if scheduler and scheduler.running:
         scheduler.shutdown(wait=False)
@@ -180,7 +203,7 @@ def train() -> dict[str, Any]:
     return train_model(force=True)
 
 
-@app.post("/predict")
+@app.post("/predict", response_model=PredictionResponse, responses={503: {"description": "No active model is available"}})
 def predict(request: PredictRequest):
     try:
         result = run_predict(request)
@@ -193,13 +216,14 @@ def predict(request: PredictRequest):
 
 @app.post("/predict/batch")
 def predict_batch(requests: list[PredictRequest]):
-    responses = []
+    try:
+        responses = predict_many(requests)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     status_code = 200
-    for request in requests:
-        result = run_predict(request)
+    for result in responses:
         if result.get("status") == "no_active_model":
             status_code = 503
-        responses.append(result)
     if status_code != 200:
         return JSONResponse(status_code=status_code, content=responses)
     return responses

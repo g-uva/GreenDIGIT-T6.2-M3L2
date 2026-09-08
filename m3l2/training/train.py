@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import math
+import hashlib
+import json
 from datetime import timezone
 from pathlib import Path
 from typing import Any
@@ -32,7 +34,7 @@ FEATURE_COLUMNS = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 
 def _make_pipeline() -> Any:
     from sklearn.compose import ColumnTransformer
-    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.ensemble import HistGradientBoostingRegressor
     from sklearn.impute import SimpleImputer
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -40,7 +42,7 @@ def _make_pipeline() -> Any:
     categorical = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="constant", fill_value="unknown")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
         ]
     )
     numeric = Pipeline(steps=[("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
@@ -53,7 +55,7 @@ def _make_pipeline() -> Any:
     return Pipeline(
         steps=[
             ("preprocessor", preprocessor),
-            ("model", RandomForestRegressor(n_estimators=80, random_state=42, n_jobs=-1)),
+            ("model", HistGradientBoostingRegressor(max_iter=80, min_samples_leaf=1, random_state=42)),
         ]
     )
 
@@ -72,7 +74,23 @@ def _metrics(y_true: pd.Series, y_pred: Any, n_train: int, n_val: int) -> dict[s
 
 
 def _version(now) -> str:
-    return f"energy-wh-{now.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
+    return f"energy-wh-{now.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
+
+
+def training_data_fingerprint(df: pd.DataFrame) -> str:
+    fingerprint_columns = ["start_ts"] + FEATURE_COLUMNS + [TARGET]
+    if df.empty:
+        payload = {"columns": fingerprint_columns, "records": []}
+    else:
+        canonical = df[fingerprint_columns].copy()
+        canonical["start_ts"] = pd.to_datetime(canonical["start_ts"], utc=True).dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        canonical = canonical.sort_values(fingerprint_columns).reset_index(drop=True)
+        payload = {
+            "columns": fingerprint_columns,
+            "records": canonical.to_dict(orient="records"),
+        }
+    data = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
 
 
 def train_model(force: bool = False) -> dict[str, Any]:
@@ -85,6 +103,18 @@ def train_model(force: bool = False) -> dict[str, Any]:
                 "status": "not_enough_data",
                 "n_records": len(df),
                 "min_training_records": settings.min_training_records,
+            }
+
+        fingerprint = training_data_fingerprint(df)
+        active_model = session.execute(
+            select(ModelRegistry).where(ModelRegistry.target == TARGET, ModelRegistry.active.is_(True))
+        ).scalars().first()
+        if not force and active_model and active_model.training_data_fingerprint == fingerprint:
+            return {
+                "status": "skipped_unchanged_data",
+                "model_version": active_model.version,
+                "training_data_fingerprint": fingerprint,
+                "n_records": len(df),
             }
 
         df = df.sort_values("start_ts").reset_index(drop=True)
@@ -114,7 +144,7 @@ def train_model(force: bool = False) -> dict[str, Any]:
         ).scalars():
             row.active = False
         registry_row = ModelRegistry(
-            model_name="random_forest_mvp",
+            model_name="hist_gradient_boosting_mvp",
             target=TARGET,
             version=version,
             path=str(model_path),
@@ -123,6 +153,7 @@ def train_model(force: bool = False) -> dict[str, Any]:
             training_window_end=df["start_ts"].max().to_pydatetime(),
             metrics=metrics,
             feature_schema=feature_schema,
+            training_data_fingerprint=fingerprint,
             active=True,
         )
         session.add(registry_row)
@@ -132,10 +163,9 @@ def train_model(force: bool = False) -> dict[str, Any]:
 
     forecast_status = "skipped"
     if sites:
-        from m3l2.app.schemas import PredictRequest
-        from m3l2.inference.predict import predict
+        from m3l2.inference.forecast_refresh import refresh_forecasts
 
-        result = predict(PredictRequest(site_ids=[site for site in sites if site], use_cache=False))
+        result = refresh_forecasts(site_ids=[site for site in sites if site], force=True)
         forecast_status = result.get("status", "stored")
 
     logger.info("Training completed for %s with metrics %s", version, metrics)
@@ -144,5 +174,6 @@ def train_model(force: bool = False) -> dict[str, Any]:
         "model_version": version,
         "path": str(model_path),
         "metrics": metrics,
+        "training_data_fingerprint": fingerprint,
         "forecast_status": forecast_status,
     }

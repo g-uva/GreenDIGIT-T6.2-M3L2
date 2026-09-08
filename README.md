@@ -36,6 +36,14 @@ Deployed as part of the **GreenDIGIT WP6.2** research activities, this module in
 - [ ] Metrics' ingestion: batch API from CNR
 - [x] Metrics' ingestion: Kafka + MQTT + Flink/Spark + PostgreSQL/InfluxDB
 - [ ] (Optional) Testbed implementation IoT with UTH
+- M3L2 MVP inference-serving path.
+  - [x] Typed broker-facing prediction schema
+  - [x] Recurrent batch forecast refresh
+  - [x] Idempotent training and workload-aware caching
+  - [x] Basic HGBR baseline
+  - [ ] Evaluate model accuracy and compare HGBR, XGBoost, LSTM and ARIMA
+  - [ ] Production load/latency testing
+  - [ ] Finalise the contract with the WP6.3 Brokering service
 
 ## Models used
 
@@ -127,7 +135,7 @@ mes server-side before padding missing inputs.
 The scoped MVP lives under `m3l2/`. It does four things:
 
 - fetches execution records from CNR MetricsDB/EIMPS;
-- stores normalized execution records plus Site Adapter profile/status snapshots in SQL;
+- stores normalised execution records plus Site Adapter profile/status snapshots in SQL;
 - trains an `energy_wh` model every 6 hours;
 - serves energy, generic efficiency, and dynamic site-status forecasts through FastAPI.
 - exposes an EIMPS-style login page for 24-hour JWT tokens.
@@ -140,6 +148,15 @@ docker compose up --build -d
 ```
 
 The Docker image uses `requirements-m3l2.txt`, a small runtime dependency set for the API. The broader `requirements.txt` still contains the heavier research stack.
+
+Key M3L2 configuration:
+
+- `M3L2_BATCH_LOOKBACK_HOURS`: rolling ingestion lookback window for scheduled MetricsDB pulls.
+- `M3L2_TRAIN_INTERVAL_HOURS`: scheduled ingestion/training interval.
+- `M3L2_FORECAST_REFRESH_MINUTES`: recurrent cached forecast refresh interval; default `15`.
+- `M3L2_FORECAST_HORIZON_HOURS`: default horizon for recurrent forecast refresh.
+- `M3L2_FORECAST_STEP_MINUTES`: default step for recurrent forecast refresh.
+- `M3L2_MIN_TRAINING_RECORDS`: minimum effective execution records required before training.
 
 Use the CNR/EIMPS ingestion path:
 
@@ -158,7 +175,34 @@ curl -X POST http://localhost:8000/train
 # Forecast site energy.
 curl -X POST http://localhost:8000/predict \
   -H "Content-Type: application/json" \
-  -d '{"site_ids":null,"horizon":"24h","step":"1h","use_cache":true}' \
+  -d '{
+    "request_id": "broker-req-001",
+    "candidate_site_ids": ["SLICES-GR-UTH", "OPENSTACK-DEMO"],
+    "forecast_start_time": "2026-09-07T12:00:00Z",
+    "horizon": "2h",
+    "step": "1h",
+    "workload": {
+      "workload_id": "workload-123",
+      "workload_type": "batch",
+      "time_requirements": {
+        "start_time": "2026-09-07T12:00:00Z",
+        "duration": "1h",
+        "deadline": "2026-09-07T16:00:00Z"
+      },
+      "resource_requirements": {
+        "cpu": 4,
+        "memory_gb": 8,
+        "storage_gb": 20,
+        "gpu": 0,
+        "instances": 1,
+        "flavour": "standard"
+      },
+      "metadata": {"project": "wp6-demo"},
+      "extensions": {"application": "training-fixture"}
+    },
+    "cache": {"use_cache": true},
+    "include_site_status": true
+  }' \
   | jq .
 
 # Inspect models and operational counters.
@@ -167,6 +211,43 @@ curl http://localhost:8000/metrics
 ```
 
 Set `M3L2_ENABLE_SCHEDULER=false` in `.env` to disable automatic ingestion and training.
+
+Concise typed response shape:
+
+```json
+{
+  "status": "ok",
+  "request_id": "broker-req-001",
+  "prediction_id": "generated-uuid",
+  "generated_at": "2026-09-07T12:00:03Z",
+  "valid_until": "2026-09-07T13:00:00Z",
+  "model_name": "hist_gradient_boosting_mvp",
+  "model_version": "energy-wh-20260907T115900000000",
+  "forecast_start_time": "2026-09-07T12:00:00Z",
+  "horizon": "2h",
+  "step": "1h",
+  "results": [
+    {
+      "site_id": "SLICES-GR-UTH",
+      "target": "energy_wh",
+      "energy_forecast": [
+        {"ts": "2026-09-07T13:00:00Z", "value": 42.0, "unit": "Wh"}
+      ],
+      "capacity": {"compute_capacity": 32, "free_cpu_capacity": 16},
+      "feasibility": {"status": "feasible", "reasons": []},
+      "workload_estimates": {
+        "expected_workload_energy_wh": 84.0,
+        "expected_workload_carbon_g": 21.0
+      },
+      "quality": {"forecast_quality": "baseline", "freshness": "cached", "confidence": "low"},
+      "warnings": []
+    }
+  ],
+  "warnings": []
+}
+```
+
+If cached forecasts are absent or stale for the normalised workload signature, `/predict` refreshes them with the active model and returns `cached_forecast_absent_refreshed` or `cached_forecast_stale_refreshed` in `warnings`. If no active model is registered, `/predict` and `/predict/batch` return `503`; malformed typed workload/time/resource inputs return validation errors.
 
 ### L2 Site Adapter login and tokens
 

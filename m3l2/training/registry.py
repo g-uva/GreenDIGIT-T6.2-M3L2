@@ -34,5 +34,6 @@ def serialise_model(row: ModelRegistry) -> dict:
         "training_window_end": row.training_window_end.isoformat() if row.training_window_end else None,
         "metrics": row.metrics,
         "feature_schema": row.feature_schema,
+        "training_data_fingerprint": row.training_data_fingerprint,
         "active": row.active,
     }

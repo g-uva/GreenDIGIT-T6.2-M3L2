@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from m3l2.app.schemas import PredictRequest
+from m3l2.app.schemas import PredictRequest, ResourceRequirements, TimeRequirements, WorkloadDescriptor
 from m3l2.inference.predict import predict as run_predict
 from m3l2.site_adapter.control_plane import forward_workload_to_site, get_db
 
@@ -15,11 +15,34 @@ router = APIRouter(prefix="/mock-broker", tags=["mock-broker"])
 
 class MockBrokerSubmitRequest(BaseModel):
     workload_id: str
+    workload_type: str = "unknown"
     candidate_sites: list[str]
     horizon: str = "24h"
     step: str = "1h"
+    start_time: str | None = None
+    duration: str | None = None
+    deadline: str | None = None
     requirements: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    extensions: dict[str, Any] = Field(default_factory=dict)
+
+
+def _resource_requirements(requirements: dict[str, Any]) -> ResourceRequirements:
+    aliases = {
+        "cpu": "cpu",
+        "cpu_cores": "cpu",
+        "memory_gb": "memory_gb",
+        "memory": "memory_gb",
+        "storage_gb": "storage_gb",
+        "storage": "storage_gb",
+        "gpu": "gpu",
+        "gpu_count": "gpu",
+        "instances": "instances",
+        "flavour": "flavour",
+        "flavor": "flavour",
+    }
+    mapped = {target: requirements[source] for source, target in aliases.items() if source in requirements}
+    return ResourceRequirements(**mapped)
 
 
 def _first_forecast_value(prediction: dict[str, Any]) -> float | None:
@@ -56,10 +79,21 @@ def _select_best_site(predictions: list[dict[str, Any]]) -> tuple[str, dict[str,
 @router.post("/submit")
 async def submit_to_best_site(payload: MockBrokerSubmitRequest, session: Session = Depends(get_db)) -> dict[str, Any]:
     prediction_request = PredictRequest(
-        site_ids=payload.candidate_sites,
+        candidate_site_ids=payload.candidate_sites,
         horizon=payload.horizon,
         step=payload.step,
-        workload={"requirements": payload.requirements, **(payload.metadata or {})},
+        workload=WorkloadDescriptor(
+            workload_id=payload.workload_id,
+            workload_type=payload.workload_type or payload.metadata.get("workload_type", "unknown"),
+            time_requirements=TimeRequirements(
+                start_time=payload.start_time,
+                duration=payload.duration,
+                deadline=payload.deadline,
+            ),
+            resource_requirements=_resource_requirements(payload.requirements),
+            metadata=payload.metadata,
+            extensions={**payload.extensions, "legacy_requirements": payload.requirements},
+        ),
         include_site_status=True,
     )
     prediction_result = run_predict(prediction_request)
@@ -69,9 +103,10 @@ async def submit_to_best_site(payload: MockBrokerSubmitRequest, session: Session
     site_id, prediction, first_value = _select_best_site(prediction_result.get("predictions") or [])
     workload_payload = {
         "workload_id": payload.workload_id,
-        "workload_type": payload.metadata.get("workload_type", "unknown"),
+        "workload_type": payload.workload_type or payload.metadata.get("workload_type", "unknown"),
         "requirements": payload.requirements,
         "metadata": payload.metadata,
+        "extensions": payload.extensions,
     }
     submission_response = await forward_workload_to_site(session, site_id, workload_payload)
     return {

@@ -151,6 +151,7 @@ class ModelRegistry(Base):
     training_window_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     metrics: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     feature_schema: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    training_data_fingerprint: Mapped[str | None] = mapped_column(String, nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -162,6 +163,8 @@ class ForecastCache(Base):
     target: Mapped[str] = mapped_column(String)
     horizon: Mapped[str] = mapped_column(String)
     step: Mapped[str] = mapped_column(String)
+    request_signature: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    forecast_start_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     valid_until: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     model_version: Mapped[str] = mapped_column(String)
@@ -208,6 +211,8 @@ def create_tables() -> None:
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
     _ensure_site_snapshot_columns(engine)
+    _ensure_model_registry_columns(engine)
+    _ensure_forecast_cache_columns(engine)
 
 
 def _ensure_site_snapshot_columns(engine: Engine) -> None:
@@ -216,6 +221,28 @@ def _ensure_site_snapshot_columns(engine: Engine) -> None:
         return
     with engine.begin() as connection:
         connection.execute(text("ALTER TABLE site_snapshots ADD COLUMN submitted_by_email VARCHAR"))
+
+
+def _ensure_model_registry_columns(engine: Engine) -> None:
+    columns = {column["name"] for column in inspect(engine).get_columns("model_registry")}
+    if "training_data_fingerprint" in columns:
+        return
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE model_registry ADD COLUMN training_data_fingerprint VARCHAR"))
+
+
+def _ensure_forecast_cache_columns(engine: Engine) -> None:
+    columns = {column["name"] for column in inspect(engine).get_columns("forecast_cache")}
+    statements = []
+    if "request_signature" not in columns:
+        statements.append("ALTER TABLE forecast_cache ADD COLUMN request_signature VARCHAR")
+    if "forecast_start_ts" not in columns:
+        statements.append("ALTER TABLE forecast_cache ADD COLUMN forecast_start_ts DATETIME")
+    if not statements:
+        return
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
 
 
 def db_status() -> str:
