@@ -41,6 +41,8 @@ Deployed as part of the **GreenDIGIT WP6.2** research activities, this module in
   - [x] Recurrent batch forecast refresh
   - [x] Idempotent training and workload-aware caching
   - [x] Basic HGBR baseline
+  - [ ] Add an operator workflow to register/configure a site before it is used for training
+  - [ ] Add a DB-backed per-site training/forecast configuration, including whether each site is enabled, its characteristics, targets, minimum data requirements and any feature overrides
   - [ ] Evaluate model accuracy and compare HGBR, XGBoost, LSTM and ARIMA
   - [ ] Production load/latency testing
   - [ ] Finalise the contract with the WP6.3 Brokering service
@@ -248,6 +250,7 @@ Concise typed response shape:
 ```
 
 If cached forecasts are absent or stale for the normalised workload signature, `/predict` refreshes them with the active model and returns `cached_forecast_absent_refreshed` or `cached_forecast_stale_refreshed` in `warnings`. If no active model is registered, `/predict` and `/predict/batch` return `503`; malformed typed workload/time/resource inputs return validation errors.
+Registered operator-facing site IDs such as `SLICES-GR-UTH` are resolved through `registered_sites.metadata.execution_records_site_id` before model inference. Responses include both `site_id` and `training_site_id`; unknown candidate sites return a clear `candidate_sites_not_found` response.
 
 ### L2 Site Adapter login and tokens
 

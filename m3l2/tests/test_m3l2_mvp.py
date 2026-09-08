@@ -8,7 +8,16 @@ import joblib
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
-from m3l2.app.db import ExecutionRecord, ForecastCache, ModelRegistry, SessionLocal, SiteProfile, SiteStatusSnapshot, utc_now
+from m3l2.app.db import (
+    ExecutionRecord,
+    ForecastCache,
+    ModelRegistry,
+    RegisteredSite,
+    SessionLocal,
+    SiteProfile,
+    SiteStatusSnapshot,
+    utc_now,
+)
 from m3l2.app.main import app
 from m3l2.app.schemas import PredictRequest
 from m3l2.inference.predict import predict
@@ -49,6 +58,16 @@ def _seed_records(count: int = 8) -> None:
                     carbon_intensity=250,
                 )
             )
+        session.add(
+            RegisteredSite(
+                site_id="PUBLIC-SITE-A",
+                site_name="Public Site A",
+                ri_type="cloud",
+                adapter_base_url="http://example.test/sites/PUBLIC-SITE-A",
+                contact_email="operator@example.test",
+                site_metadata={"execution_records_site_id": "site-a"},
+            )
+        )
         session.commit()
 
 
@@ -217,6 +236,60 @@ def test_successful_typed_predict_request(temp_database, monkeypatch, tmp_path):
     assert body["request_id"] == "req-typed"
     assert body["results"][0]["site_id"] == "site-a"
     assert body["results"][0]["energy_forecast"][0]["unit"] == "Wh"
+
+
+def test_predict_resolves_registered_site_to_training_site(temp_database, monkeypatch, tmp_path):
+    _prepare_training(monkeypatch, tmp_path)
+    train_model(force=True)
+    payload = _predict_payload("mapped")
+    payload["candidate_site_ids"] = ["PUBLIC-SITE-A"]
+
+    prediction = predict(payload)
+
+    result = prediction["results"][0]
+    assert result["site_id"] == "PUBLIC-SITE-A"
+    assert result["training_site_id"] == "site-a"
+    assert result["registered_site_id"] == "PUBLIC-SITE-A"
+    assert result["site_id_resolution"] == "registered_site_mapping"
+    assert "missing_execution_history" not in result["warnings"]
+
+
+def test_public_and_training_site_ids_reuse_cache_entry(temp_database, monkeypatch, tmp_path):
+    _prepare_training(monkeypatch, tmp_path)
+    train_model(force=True)
+    public_payload = _predict_payload("alias")
+    public_payload["candidate_site_ids"] = ["PUBLIC-SITE-A"]
+    raw_payload = _predict_payload("alias")
+    raw_payload["candidate_site_ids"] = ["site-a"]
+
+    public_response = predict(public_payload)
+    raw_response = predict(raw_payload)
+
+    assert public_response["cache"]["request_signature"] == raw_response["cache"]["request_signature"]
+    assert raw_response["cache"]["status"] == "cached"
+    with SessionLocal() as session:
+        count = session.scalar(
+            select(func.count())
+            .select_from(ForecastCache)
+            .where(ForecastCache.request_signature == public_response["cache"]["request_signature"])
+        )
+    assert count == 1
+
+
+def test_predict_returns_clear_error_for_unknown_site(temp_database, monkeypatch, tmp_path):
+    _prepare_training(monkeypatch, tmp_path)
+    train_model(force=True)
+    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
+    payload = _predict_payload("missing")
+    payload["candidate_site_ids"] = ["UNKNOWN-SITE"]
+
+    with TestClient(app) as client:
+        response = client.post("/predict", json=payload)
+
+    assert response.status_code == 404
+    body = response.json()
+    assert body["status"] == "candidate_sites_not_found"
+    assert body["missing_site_ids"] == ["UNKNOWN-SITE"]
 
 
 def test_invalid_workload_time_and_resource_inputs(temp_database, monkeypatch):

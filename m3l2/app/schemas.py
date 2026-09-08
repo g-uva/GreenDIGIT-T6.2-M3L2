@@ -217,6 +217,10 @@ class Feasibility(APIModel):
 
 class SitePrediction(APIModel):
     site_id: str
+    training_site_id: str | None = None
+    registered_site_id: str | None = None
+    requested_site_id: str | None = None
+    site_id_resolution: str | None = None
     target: str = "energy_wh"
     forecast: list[ForecastPoint]
     energy_forecast: list[ForecastPoint] = Field(default_factory=list)

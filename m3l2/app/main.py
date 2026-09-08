@@ -211,6 +211,8 @@ def predict(request: PredictRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if result.get("status") == "no_active_model":
         return JSONResponse(status_code=503, content=result)
+    if result.get("status") == "candidate_sites_not_found":
+        return JSONResponse(status_code=404, content=result)
     return result
 
 
@@ -224,6 +226,8 @@ def predict_batch(requests: list[PredictRequest]):
     for result in responses:
         if result.get("status") == "no_active_model":
             status_code = 503
+        elif result.get("status") == "candidate_sites_not_found" and status_code == 200:
+            status_code = 404
     if status_code != 200:
         return JSONResponse(status_code=status_code, content=responses)
     return responses

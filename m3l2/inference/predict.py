@@ -13,7 +13,16 @@ import pandas as pd
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from m3l2.app.db import ExecutionRecord, SessionLocal, SiteProfile, SiteSnapshot, SiteStatusSnapshot, create_tables, utc_now
+from m3l2.app.db import (
+    ExecutionRecord,
+    RegisteredSite,
+    SessionLocal,
+    SiteProfile,
+    SiteSnapshot,
+    SiteStatusSnapshot,
+    create_tables,
+    utc_now,
+)
 from m3l2.app.schemas import PredictRequest
 from m3l2.inference.cache import cache_state, get_valid_cache, store_cache
 from m3l2.training.registry import get_active_model
@@ -115,9 +124,18 @@ def _site_profile(session: Session, site_id: str) -> SiteProfile | None:
     return session.execute(select(SiteProfile).where(SiteProfile.site_id == site_id)).scalar_one_or_none()
 
 
-def _site_ids(session: Session, requested: list[str] | None) -> list[str]:
-    if requested:
-        return list(dict.fromkeys(requested))
+def _registered_site_maps(session: Session) -> tuple[dict[str, str], dict[str, str]]:
+    public_to_training: dict[str, str] = {}
+    training_to_public: dict[str, str] = {}
+    for row in session.execute(select(RegisteredSite)).scalars().all():
+        metadata = row.site_metadata or {}
+        training_site_id = metadata.get("execution_records_site_id") or row.site_id
+        public_to_training[row.site_id] = training_site_id
+        training_to_public.setdefault(training_site_id, row.site_id)
+    return public_to_training, training_to_public
+
+
+def _known_site_ids(session: Session) -> set[str]:
     sites: set[str] = set()
     for model, column in (
         (ExecutionRecord, ExecutionRecord.site_id),
@@ -126,7 +144,43 @@ def _site_ids(session: Session, requested: list[str] | None) -> list[str]:
         (SiteSnapshot, SiteSnapshot.site_id),
     ):
         sites.update(site for site in session.execute(select(column).distinct()).scalars().all() if site)
-    return sorted(sites)
+    return sites
+
+
+def _resolve_candidate_sites(session: Session, requested: list[str] | None) -> tuple[list[dict[str, str | None]], list[str]]:
+    public_to_training, training_to_public = _registered_site_maps(session)
+    known_sites = _known_site_ids(session)
+    candidates = list(dict.fromkeys(requested or sorted(set(public_to_training) | known_sites)))
+    resolved: list[dict[str, str | None]] = []
+    missing: list[str] = []
+    seen_training: set[str] = set()
+
+    for candidate in candidates:
+        training_site_id = public_to_training.get(candidate, candidate)
+        registered_site_id = candidate if candidate in public_to_training else training_to_public.get(candidate)
+        is_known = candidate in public_to_training or training_site_id in known_sites or candidate in known_sites
+        if not is_known:
+            missing.append(candidate)
+            continue
+        if training_site_id in seen_training:
+            continue
+        seen_training.add(training_site_id)
+        if candidate in public_to_training:
+            response_site_id = candidate
+            resolution = "registered_site_mapping" if training_site_id != candidate else "registered_site_direct"
+        else:
+            response_site_id = candidate
+            resolution = "execution_records_site_id" if registered_site_id else "direct_site_id"
+        resolved.append(
+            {
+                "site_id": response_site_id,
+                "training_site_id": training_site_id,
+                "registered_site_id": registered_site_id,
+                "requested_site_id": candidate,
+                "site_id_resolution": resolution,
+            }
+        )
+    return resolved, missing
 
 
 def _duration_s(row: ExecutionRecord | None) -> float:
@@ -362,7 +416,7 @@ def _load_pipeline(model_row: Any) -> Any:
 
 def _result_from_forecast(
     session: Session,
-    site_id: str,
+    site: dict[str, str | None],
     forecast_rows: list[dict[str, Any]],
     request: PredictRequest,
     generated_at: datetime,
@@ -372,9 +426,11 @@ def _result_from_forecast(
     cache_status: str,
     signature: str,
 ) -> dict[str, Any]:
-    context = _latest_context(session, site_id)
-    status = _latest_site_status(session, site_id)
-    profile = _site_profile(session, site_id)
+    site_id = site["site_id"] or site["training_site_id"]
+    training_site_id = site["training_site_id"] or site_id
+    context = _latest_context(session, training_site_id)
+    status = _latest_site_status(session, training_site_id)
+    profile = _site_profile(session, training_site_id)
     workload = _workload_dict(request)
     warnings: list[str] = []
     if context is None:
@@ -394,11 +450,15 @@ def _result_from_forecast(
     }
     return {
         "site_id": site_id,
+        "training_site_id": training_site_id,
+        "registered_site_id": site.get("registered_site_id"),
+        "requested_site_id": site.get("requested_site_id"),
+        "site_id_resolution": site.get("site_id_resolution"),
         "target": TARGET,
         "forecast": forecast,
         "energy_forecast": forecast,
         "site_status_forecast": _status_forecast(status, profile, timestamps),
-        "latest_site_status": _latest_l2_status_metadata(session, site_id),
+        "latest_site_status": _latest_l2_status_metadata(session, site_id) if site_id else None,
         "capacity": _capacity(status, profile),
         "feasibility": _feasibility(status, profile, workload),
         "workload_estimates": estimates,
@@ -459,12 +519,21 @@ def _predict_with_session(request: PredictRequest | dict[str, Any], session: Ses
     generated_at = utc_now()
     forecast_start = _ensure_utc(request.forecast_start_time) if request.forecast_start_time else _floor_to_step(generated_at, step_delta)
     valid_until = forecast_start + step_delta
-    sites = _site_ids(session, request.candidate_site_ids)
+    sites, missing_sites = _resolve_candidate_sites(session, request.candidate_site_ids)
+    training_site_ids = [site["training_site_id"] for site in sites if site["training_site_id"]]
     warnings: list[str] = []
+    if missing_sites:
+        warnings.append(f"candidate_sites_not_found:{','.join(missing_sites)}")
+    if request.candidate_site_ids and not sites:
+        return {
+            "status": "candidate_sites_not_found",
+            "detail": "None of the requested candidate sites could be resolved to registered or training-compatible L2DB data.",
+            "missing_site_ids": missing_sites or request.candidate_site_ids,
+        }
     if not sites:
         warnings.append("no_candidate_sites")
 
-    signature = request_signature(request, sites, forecast_start, TARGET, session)
+    signature = request_signature(request, training_site_ids, forecast_start, TARGET, session)
     n_steps = int(horizon_delta.total_seconds() // step_delta.total_seconds())
     timestamps = [forecast_start + (step_delta * idx) for idx in range(1, n_steps + 1)]
     use_cache = bool(request.cache.use_cache)
@@ -473,7 +542,8 @@ def _predict_with_session(request: PredictRequest | dict[str, Any], session: Ses
         cached_results = []
         cached_valid_until: list[datetime] = []
         cache_states = []
-        for site_id in sites:
+        for site in sites:
+            site_id = site["training_site_id"]
             state = cache_state(session, site_id, TARGET, request.horizon, request.step, model_row.version, signature)
             cache_states.append(state)
             cached = get_valid_cache(session, site_id, TARGET, request.horizon, request.step, model_row.version, signature)
@@ -483,7 +553,7 @@ def _predict_with_session(request: PredictRequest | dict[str, Any], session: Ses
             cached_results.append(
                 _result_from_forecast(
                     session,
-                    site_id,
+                    site,
                     cached.predictions,
                     request,
                     generated_at,
@@ -515,16 +585,17 @@ def _predict_with_session(request: PredictRequest | dict[str, Any], session: Ses
             warnings.append("cached_forecast_absent_refreshed")
 
     pipeline = _load_pipeline(model_row)
-    contexts = {site_id: _latest_context(session, site_id) for site_id in sites}
+    contexts = {site["training_site_id"]: _latest_context(session, site["training_site_id"]) for site in sites}
     feature_rows: list[dict[str, Any]] = []
     row_keys: list[tuple[str, datetime]] = []
     workload = _workload_dict(request)
-    for site_id in sites:
+    for site in sites:
+        site_id = site["training_site_id"]
         for ts in timestamps:
             row_keys.append((site_id, ts))
             feature_rows.append(_base_feature_row(site_id, contexts[site_id], ts, workload))
 
-    predicted_by_site: dict[str, list[dict[str, Any]]] = {site_id: [] for site_id in sites}
+    predicted_by_site: dict[str, list[dict[str, Any]]] = {site["training_site_id"]: [] for site in sites}
     if feature_rows:
         frame = pd.DataFrame(feature_rows, columns=FEATURE_COLUMNS)
         values = pipeline.predict(frame)
@@ -532,7 +603,8 @@ def _predict_with_session(request: PredictRequest | dict[str, Any], session: Ses
             predicted_by_site[site_id].append({"ts": ts.isoformat(), "value": max(float(value), 0.0), "unit": "Wh"})
 
     results = []
-    for site_id in sites:
+    for site in sites:
+        site_id = site["training_site_id"]
         forecast_rows = predicted_by_site[site_id]
         quality = _quality("fresh", 1.0 if contexts[site_id] else 0.0, model_row.metrics)
         store_cache(
@@ -552,7 +624,7 @@ def _predict_with_session(request: PredictRequest | dict[str, Any], session: Ses
         results.append(
             _result_from_forecast(
                 session,
-                site_id,
+                site,
                 forecast_rows,
                 request,
                 generated_at,

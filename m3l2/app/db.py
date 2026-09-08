@@ -237,7 +237,8 @@ def _ensure_forecast_cache_columns(engine: Engine) -> None:
     if "request_signature" not in columns:
         statements.append("ALTER TABLE forecast_cache ADD COLUMN request_signature VARCHAR")
     if "forecast_start_ts" not in columns:
-        statements.append("ALTER TABLE forecast_cache ADD COLUMN forecast_start_ts DATETIME")
+        timestamp_type = "DATETIME" if engine.dialect.name == "sqlite" else "TIMESTAMP WITH TIME ZONE"
+        statements.append(f"ALTER TABLE forecast_cache ADD COLUMN forecast_start_ts {timestamp_type}")
     if not statements:
         return
     with engine.begin() as connection:
