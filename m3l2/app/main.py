@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import Body, Depends, FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
@@ -25,6 +25,7 @@ from m3l2.app.db import (
     create_tables,
     utc_now,
 )
+from m3l2.app.operator_config import config_payload, training_readiness, update_config
 from m3l2.app.schemas import IngestRunRequest, PredictRequest, PredictionResponse
 from m3l2.auth.router import router as auth_router
 from m3l2.broker_mock.router import router as mock_broker_router
@@ -32,7 +33,7 @@ from m3l2.inference.forecast_refresh import refresh_forecasts
 from m3l2.inference.predict import predict as run_predict, predict_many
 from m3l2.ingestion.jobs import run_ingestion
 from m3l2.ingestion.site_adapter import SiteAdapterValidationError, normalise_site_profile, normalise_site_status
-from m3l2.site_adapter.auth import SitePrincipal, current_principal
+from m3l2.site_adapter.auth import SitePrincipal, current_principal, require_roles
 from m3l2.site_adapter.control_plane import router as site_adapter_router
 from m3l2.site_adapter.mock_l3 import router as mock_l3_router
 from m3l2.training.registry import get_active_model, get_model_by_version, list_models, serialise_model
@@ -76,6 +77,11 @@ def _warnings(index: int, profile_or_status: dict[str, Any]) -> dict[str, Any] |
     if not fields:
         return None
     return {"index": index, "fields": fields}
+
+
+def require_same_site_for_ops(principal: SitePrincipal, site_id: str) -> None:
+    if principal.site_id != site_id:
+        raise HTTPException(status_code=403, detail="JWT site_id does not match requested site_id")
 
 
 PROFILE_SUBMISSION_DESCRIPTION = """
@@ -264,12 +270,55 @@ def get_db() -> Session:
         yield session
 
 
+def _service_effective_config() -> dict[str, Any]:
+    with SessionLocal() as session:
+        return config_payload(session)["effective"]
+
+
+def configure_scheduler_jobs() -> dict[str, Any]:
+    global scheduler
+    cfg = _service_effective_config()
+    if scheduler is None:
+        scheduler = BackgroundScheduler(timezone="UTC")
+
+    scheduler.remove_all_jobs()
+    if not cfg["automatic_training"]:
+        return {"status": "disabled", "automatic_training": False}
+
+    scheduler.add_job(
+        _scheduled_cycle,
+        "interval",
+        hours=int(cfg["training_frequency_hours"]),
+        id="m3l2_train",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _scheduled_forecast_refresh,
+        "interval",
+        minutes=int(cfg["forecast_refresh_minutes"]),
+        id="m3l2_forecast_refresh",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    if not scheduler.running:
+        scheduler.start()
+    return {
+        "status": "scheduled",
+        "automatic_training": True,
+        "training_frequency_hours": cfg["training_frequency_hours"],
+        "forecast_refresh_minutes": cfg["forecast_refresh_minutes"],
+        "jobs": sorted(job.id for job in scheduler.get_jobs()),
+    }
+
+
 def _scheduled_cycle() -> None:
-    logger.info("Starting scheduled M3L2 ingestion and training cycle")
+    logger.info("Starting scheduled M3L2 training cycle")
     try:
-        ingestion_summary = run_ingestion()
         training_summary = train_model(force=False)
-        logger.info("Scheduled M3L2 cycle completed: ingestion=%s training=%s", ingestion_summary, training_summary)
+        logger.info("Scheduled M3L2 training cycle completed: %s", training_summary)
     except Exception:
         logger.exception("Scheduled M3L2 cycle failed")
 
@@ -288,35 +337,13 @@ async def lifespan(app: FastAPI):
     global scheduler
     create_tables()
     settings = get_settings()
-    if settings.enable_scheduler and (scheduler is None or not scheduler.running):
-        scheduler = BackgroundScheduler(timezone="UTC")
-        scheduler.add_job(
-            _scheduled_cycle,
-            "interval",
-            hours=settings.train_interval_hours,
-            id="m3l2_ingest_train",
-            max_instances=1,
-            coalesce=True,
-            replace_existing=True,
-        )
-        scheduler.add_job(
-            _scheduled_forecast_refresh,
-            "interval",
-            minutes=settings.forecast_refresh_minutes,
-            id="m3l2_forecast_refresh",
-            max_instances=1,
-            coalesce=True,
-            replace_existing=True,
-        )
-        scheduler.start()
-        logger.info(
-            "Started M3L2 scheduler with %sh training interval and %sm forecast refresh interval",
-            settings.train_interval_hours,
-            settings.forecast_refresh_minutes,
-        )
+    if settings.enable_scheduler:
+        logger.info("M3L2 scheduler configured: %s", configure_scheduler_jobs())
     yield
-    if scheduler and scheduler.running:
-        scheduler.shutdown(wait=False)
+    if scheduler:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+        scheduler = None
         logger.info("Stopped M3L2 scheduler")
 
 
@@ -405,8 +432,178 @@ def ingest_run(request: IngestRunRequest | None = None) -> dict[str, Any]:
 
 
 @app.post("/train", tags=["m3l2-ops"])
-def train() -> dict[str, Any]:
-    return train_model(force=True)
+def train(principal: SitePrincipal = Depends(require_roles("site_admin"))) -> dict[str, Any]:
+    return train_model(force=True, triggered_by_email=principal.email)
+
+
+@app.get("/ops/config/ui", response_class=HTMLResponse, include_in_schema=False)
+def operator_config_page() -> HTMLResponse:
+    return HTMLResponse(
+        """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>M3L2 Operator Configuration</title>
+    <link rel="stylesheet" href="/static/auth.css">
+    <style>
+        .config-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+        .config-grid label { display: grid; gap: 6px; color: #243042; font-size: 0.92rem; }
+        .config-grid input, .config-grid select { width: 100%; box-sizing: border-box; }
+        .inline-check { display: flex; align-items: center; gap: 8px; margin: 10px 0; color: #4b5563; }
+        .inline-check input { width: auto; }
+        .button-row { display: flex; gap: 10px; flex-wrap: wrap; }
+        pre { white-space: pre-wrap; word-break: break-word; background: #111827; color: #e5e7eb; padding: 12px; border-radius: 8px; font-size: 0.82rem; }
+        .status-line { min-height: 1.4rem; color: #374151; }
+    </style>
+</head>
+<body>
+    <main class="auth-shell">
+        <section class="auth-panel auth-panel-wide">
+            <img src="/static/cropped-GD_logo.png" alt="GreenDIGIT" class="auth-logo">
+            <h1>M3L2 Operator Configuration</h1>
+            <form id="config-form">
+                <input id="token" type="password" placeholder="Bearer token" autocomplete="off" required>
+                <input id="site-id" type="text" placeholder="Site override ID, optional">
+                <label class="inline-check"><input type="checkbox" disabled> Connect to EIMPS <span>Not yet available</span></label>
+                <div class="config-grid">
+                    <label>Automatic training <select id="automatic_training"><option value="true">Enabled</option><option value="false">Manual</option></select></label>
+                    <label>Training frequency hours <input id="training_frequency_hours" type="number" min="1" max="168"></label>
+                    <label>Training window hours <input id="training_window_hours" type="number" min="1"></label>
+                    <label>Minimum usable records <input id="min_usable_records" type="number" min="1"></label>
+                    <label>Forecast horizon hours <input id="forecast_horizon_hours" type="number" min="1"></label>
+                    <label>Forecast step minutes <input id="forecast_step_minutes" type="number" min="1"></label>
+                    <label>Forecast refresh minutes <input id="forecast_refresh_minutes" type="number" min="1"></label>
+                    <label>Aggregation interval minutes <input id="aggregation_interval_minutes" type="number" min="1"></label>
+                    <label>Submission cadence minutes <input id="submission_cadence_minutes" type="number" min="1"></label>
+                    <label>Staleness limit minutes <input id="staleness_limit_minutes" type="number" min="1"></label>
+                    <label>Minimum coverage ratio <input id="minimum_coverage_ratio" type="number" min="0" max="1" step="0.01"></label>
+                    <label>Model <select id="model_name"><option value="hist_gradient_boosting_mvp">hist_gradient_boosting_mvp</option><option value="xgb" disabled>xgb - Not yet available</option><option value="lstm" disabled>lstm - Not yet available</option></select></label>
+                </div>
+                <div class="button-row">
+                    <button type="button" id="load">Load</button>
+                    <button type="submit">Save</button>
+                    <button type="button" id="train">Train now</button>
+                </div>
+            </form>
+            <p id="status" class="status-line"></p>
+            <h2>Effective Configuration</h2>
+            <pre id="effective">{}</pre>
+            <h2>Training Readiness</h2>
+            <pre id="readiness">{}</pre>
+        </section>
+    </main>
+    <script>
+        const fields = ["training_frequency_hours", "training_window_hours", "min_usable_records", "forecast_horizon_hours", "forecast_step_minutes", "forecast_refresh_minutes", "aggregation_interval_minutes", "submission_cadence_minutes", "staleness_limit_minutes", "minimum_coverage_ratio", "model_name", "automatic_training"];
+        const status = document.getElementById("status");
+        const siteId = () => document.getElementById("site-id").value.trim();
+        const auth = () => ({Authorization: `Bearer ${document.getElementById("token").value.trim()}`});
+        const suffix = () => siteId() ? `?site_id=${encodeURIComponent(siteId())}` : "";
+        function setStatus(text) { status.textContent = text; }
+        function fill(config) {
+            const effective = config.effective || {};
+            for (const field of fields) {
+                const el = document.getElementById(field);
+                if (effective[field] !== undefined) el.value = String(effective[field]);
+            }
+            document.getElementById("effective").textContent = JSON.stringify(config, null, 2);
+        }
+        function payload() {
+            const out = {};
+            for (const field of fields) {
+                const el = document.getElementById(field);
+                if (field === "automatic_training") out[field] = el.value === "true";
+                else if (field === "model_name") out[field] = el.value;
+                else if (field === "minimum_coverage_ratio") out[field] = Number(el.value);
+                else out[field] = Number.parseInt(el.value, 10);
+            }
+            return out;
+        }
+        async function jsonFetch(url, options = {}) {
+            const response = await fetch(url, {...options, headers: {...auth(), "Content-Type": "application/json", ...(options.headers || {})}});
+            const body = await response.json();
+            if (!response.ok) throw new Error(JSON.stringify(body.detail || body));
+            return body;
+        }
+        async function loadAll() {
+            const config = await jsonFetch(`/ops/config${suffix()}`);
+            fill(config);
+            const readiness = await jsonFetch(`/ops/training/readiness${suffix()}`);
+            document.getElementById("readiness").textContent = JSON.stringify(readiness, null, 2);
+            setStatus("Loaded.");
+        }
+        document.getElementById("load").addEventListener("click", () => loadAll().catch(error => setStatus(error.message)));
+        document.getElementById("config-form").addEventListener("submit", async event => {
+            event.preventDefault();
+            try {
+                fill(await jsonFetch(`/ops/config${suffix()}`, {method: "PATCH", body: JSON.stringify(payload())}));
+                await loadAll();
+                setStatus("Saved. Scheduler changes are immediate; training-quality changes apply on the next run and usually require retraining.");
+            } catch (error) { setStatus(error.message); }
+        });
+        document.getElementById("train").addEventListener("click", async () => {
+            try {
+                const result = await jsonFetch(`/ops/train${suffix()}`, {method: "POST", body: "{}"});
+                document.getElementById("readiness").textContent = JSON.stringify(result, null, 2);
+                setStatus("Training request completed.");
+            } catch (error) { setStatus(error.message); }
+        });
+    </script>
+</body>
+</html>"""
+    )
+
+
+@app.get("/ops/config", tags=["m3l2-ops"])
+def get_operator_config(
+    site_id: str | None = None,
+    principal: SitePrincipal = Depends(require_roles("site_admin")),
+    session: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if site_id:
+        require_same_site_for_ops(principal, site_id)
+    return config_payload(session, site_id=site_id)
+
+
+@app.patch("/ops/config", tags=["m3l2-ops"])
+def patch_operator_config(
+    patch: dict[str, Any] = Body(...),
+    site_id: str | None = None,
+    principal: SitePrincipal = Depends(require_roles("site_admin")),
+    session: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if site_id:
+        require_same_site_for_ops(principal, site_id)
+    try:
+        update_config(session, patch, site_id=site_id, updated_by_email=principal.email)
+    except ValueError as exc:
+        detail = exc.args[0] if exc.args and isinstance(exc.args[0], list) else str(exc)
+        raise HTTPException(status_code=422, detail=detail) from exc
+    scheduler_state = configure_scheduler_jobs() if site_id is None else None
+    payload = config_payload(session, site_id=site_id)
+    payload["scheduler"] = scheduler_state
+    return payload
+
+
+@app.get("/ops/training/readiness", tags=["m3l2-ops"])
+def get_training_readiness(
+    site_id: str | None = None,
+    principal: SitePrincipal = Depends(require_roles("site_admin")),
+    session: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if site_id:
+        require_same_site_for_ops(principal, site_id)
+    return training_readiness(session, site_id=site_id)
+
+
+@app.post("/ops/train", tags=["m3l2-ops"])
+def train_now(
+    site_id: str | None = None,
+    principal: SitePrincipal = Depends(require_roles("site_admin")),
+) -> dict[str, Any]:
+    if site_id:
+        require_same_site_for_ops(principal, site_id)
+    return train_model(force=True, triggered_by_email=principal.email, site_id=site_id)
 
 
 @app.post(

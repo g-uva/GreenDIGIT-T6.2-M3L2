@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from m3l2.app.db import AuthUser, RegisteredSite, SessionLocal, SiteProfile, SiteSnapshot, SiteStatusSnapshot
+from m3l2.app.db import AuthUser, OperatorConfig, RegisteredSite, SessionLocal, SiteProfile, SiteSnapshot, SiteStatusSnapshot
 from m3l2.app.main import app
 from m3l2.site_adapter.auth import create_site_jwt
 
@@ -132,6 +132,163 @@ def test_l2_predict_requires_model_after_bearer_token(temp_database, monkeypatch
 
     assert response.status_code == 503
     assert response.json()["status"] == "no_active_model"
+
+
+def test_site_registration_and_telemetry_submission_do_not_require_eimps_records(temp_database, monkeypatch):
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    with SessionLocal() as session:
+        session.add(AuthUser(email="admin@uth.gr", password_hash="unused", enabled=True))
+        session.commit()
+
+    register_payload = {
+        "site_id": "NEW-SITE",
+        "site_name": "New Site",
+        "ri_type": "network",
+        "adapter_base_url": "http://127.0.0.1:8000/mock-l3/sites/NEW-SITE",
+        "contact_email": "admin@uth.gr",
+    }
+    telemetry_payload = {
+        "timestamp": "2026-09-07T01:00:00Z",
+        "ri_type": "network",
+        "operational_status": "UP",
+        "maintenance_flag": False,
+        "node_availability": 1.0,
+        "link_availability": 1.0,
+        "free_cpu_capacity": 8,
+        "queue_length": 0,
+        "load_index": 0.1,
+    }
+
+    with TestClient(app) as client:
+        registered = client.post(
+            "/l2/sites/register",
+            headers=_auth_header("admin@uth.gr", "NEW-SITE", "site_admin"),
+            json=register_payload,
+        )
+        submitted = client.post(
+            "/l2/sites/NEW-SITE/snapshots",
+            headers=_auth_header("admin@uth.gr", "NEW-SITE", "site_admin"),
+            json=telemetry_payload,
+        )
+
+    assert registered.status_code == 200
+    assert submitted.status_code == 200
+    with SessionLocal() as session:
+        status = session.execute(select(SiteStatusSnapshot).where(SiteStatusSnapshot.site_id == "NEW-SITE")).scalars().first()
+    assert status is not None
+    assert status.node_availability == 1.0
+
+
+def test_operator_config_requires_site_admin(temp_database, monkeypatch):
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    _seed_site()
+
+    with TestClient(app) as client:
+        no_token = client.patch("/ops/config", json={"training_frequency_hours": 2})
+        publisher = client.patch(
+            "/ops/config",
+            headers=_auth_header("publisher@uth.gr", role="publisher"),
+            json={"training_frequency_hours": 2},
+        )
+
+    assert no_token.status_code == 401
+    assert publisher.status_code == 403
+
+
+def test_train_now_requires_site_admin_and_records_operator(temp_database, monkeypatch):
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    _seed_site()
+    captured = {}
+
+    def fake_train_model(force: bool, triggered_by_email: str | None = None, site_id: str | None = None):
+        captured["force"] = force
+        captured["triggered_by_email"] = triggered_by_email
+        captured["site_id"] = site_id
+        return {"status": "trained", "model_version": "test-model"}
+
+    monkeypatch.setattr("m3l2.app.main.train_model", fake_train_model)
+
+    with TestClient(app) as client:
+        publisher = client.post("/ops/train", headers=_auth_header("publisher@uth.gr", role="publisher"))
+        admin = client.post("/ops/train?site_id=SLICES-GR-UTH", headers=_auth_header(role="site_admin"))
+
+    assert publisher.status_code == 403
+    assert admin.status_code == 200
+    assert captured == {"force": True, "triggered_by_email": "reader@uth.gr", "site_id": "SLICES-GR-UTH"}
+
+
+def test_operator_config_persists_service_and_site_overrides(temp_database, monkeypatch):
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
+    _seed_site()
+
+    with TestClient(app) as client:
+        service = client.patch(
+            "/ops/config",
+            headers=_auth_header(role="site_admin"),
+            json={"training_frequency_hours": 4, "min_usable_records": 3, "minimum_coverage_ratio": 0.5},
+        )
+        site = client.patch(
+            "/ops/config?site_id=SLICES-GR-UTH",
+            headers=_auth_header(role="site_admin"),
+            json={"min_usable_records": 2},
+        )
+        effective = client.get("/ops/config?site_id=SLICES-GR-UTH", headers=_auth_header(role="site_admin"))
+        disabled_model = client.patch(
+            "/ops/config",
+            headers=_auth_header(role="site_admin"),
+            json={"model_name": "xgb"},
+        )
+
+    assert service.status_code == 200
+    assert site.status_code == 200
+    assert effective.status_code == 200
+    body = effective.json()
+    assert body["service_overrides"]["training_frequency_hours"] == 4
+    assert body["site_overrides"]["min_usable_records"] == 2
+    assert body["effective"]["min_usable_records"] == 2
+    assert body["effective"]["model_name"] == "hist_gradient_boosting_mvp"
+    assert disabled_model.status_code == 422
+    with SessionLocal() as session:
+        assert session.get(OperatorConfig, "service").settings["min_usable_records"] == 3
+
+
+def test_operator_config_scheduler_changes_are_reported(temp_database, monkeypatch):
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
+    _seed_site()
+
+    with TestClient(app) as client:
+        disabled = client.patch(
+            "/ops/config",
+            headers=_auth_header(role="site_admin"),
+            json={"automatic_training": False},
+        )
+        enabled = client.patch(
+            "/ops/config",
+            headers=_auth_header(role="site_admin"),
+            json={"automatic_training": True, "training_frequency_hours": 3, "forecast_refresh_minutes": 7},
+        )
+
+    assert disabled.status_code == 200
+    assert disabled.json()["scheduler"]["status"] == "disabled"
+    assert enabled.status_code == 200
+    assert enabled.json()["scheduler"]["status"] == "scheduled"
+    assert enabled.json()["scheduler"]["jobs"] == ["m3l2_forecast_refresh", "m3l2_train"]
+
+
+def test_operator_config_ui_marks_unavailable_features_disabled(temp_database, monkeypatch):
+    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
+
+    with TestClient(app) as client:
+        response = client.get("/ops/config/ui")
+
+    assert response.status_code == 200
+    text = response.text
+    assert "Connect to EIMPS" in text
+    assert "Not yet available" in text
+    assert '<option value="xgb" disabled>' in text
+    assert '<option value="lstm" disabled>' in text
 
 
 def test_l2_site_reads_return_authenticated_site_data(temp_database, monkeypatch):

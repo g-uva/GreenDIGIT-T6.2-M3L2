@@ -95,6 +95,30 @@ class SiteStatusSnapshot(Base):
     ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class OperatorConfig(Base):
+    __tablename__ = "operator_configs"
+
+    config_key: Mapped[str] = mapped_column(String, primary_key=True)
+    site_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    settings: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_by_email: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class TrainingRun(Base):
+    __tablename__ = "training_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    site_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    triggered_by_email: Mapped[str | None] = mapped_column(String, nullable=True)
+    model_version: Mapped[str | None] = mapped_column(String, nullable=True)
+    detail: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
 class RegisteredSite(Base):
     __tablename__ = "registered_sites"
 

@@ -33,6 +33,17 @@ STATUS_TARGET_COLUMNS = [
     "load_index",
 ]
 
+STATUS_REQUIRED_INPUTS = [
+    "site_id",
+    "timestamp",
+    "operational_status",
+    "node_availability",
+    "link_availability",
+    "free_cpu_capacity",
+    "queue_length",
+    "load_index",
+]
+
 STATUS_FEATURE_COLUMNS = [
     "site_id",
     "ri_type",
@@ -156,9 +167,13 @@ def _snapshot_training_row(snapshot: SiteSnapshot) -> dict | None:
     }
 
 
-def build_site_status_training_frame(session: Session) -> pd.DataFrame:
-    rows = session.execute(select(SiteStatusSnapshot)).scalars().all()
+def build_site_status_training_frame(session: Session, site_id: str | None = None) -> pd.DataFrame:
+    from m3l2.app.operator_config import usable_status_rows
+
+    rows = usable_status_rows(session, site_id)
     snapshots = session.execute(select(SiteSnapshot)).scalars().all()
+    if site_id:
+        snapshots = [snapshot for snapshot in snapshots if snapshot.site_id == site_id]
     if not rows and not snapshots:
         return pd.DataFrame(columns=STATUS_FEATURE_COLUMNS + STATUS_TARGET_COLUMNS)
 
@@ -184,9 +199,13 @@ def build_site_status_training_frame(session: Session) -> pd.DataFrame:
     df["provisioning_delay_s"] = pd.to_numeric(df["provisioning_delay_s"], errors="coerce")
     df["load_index"] = pd.to_numeric(df["load_index"], errors="coerce")
     df["cpu_util_avg"] = pd.to_numeric(df["cpu_util_avg"], errors="coerce")
-    df["node_availability"] = df["node_availability"].fillna(1.0).clip(lower=0.0, upper=1.0)
-    df["link_availability"] = df["link_availability"].fillna(df["node_availability"]).clip(lower=0.0, upper=1.0)
-    df["free_cpu_capacity"] = df["free_cpu_capacity"].fillna(0.0).clip(lower=0.0)
+    df = df.dropna(subset=["node_availability", "link_availability", "free_cpu_capacity", "queue_length", "load_index"])
+    if df.empty:
+        return pd.DataFrame(columns=STATUS_FEATURE_COLUMNS + STATUS_TARGET_COLUMNS)
+
+    df["node_availability"] = df["node_availability"].clip(lower=0.0, upper=1.0)
+    df["link_availability"] = df["link_availability"].clip(lower=0.0, upper=1.0)
+    df["free_cpu_capacity"] = df["free_cpu_capacity"].clip(lower=0.0)
     df["free_gpu_capacity"] = df["free_gpu_capacity"].fillna(0.0).clip(lower=0.0)
     df["queue_length"] = df["queue_length"].fillna(0.0).clip(lower=0.0)
     df["provisioning_delay_s"] = df["provisioning_delay_s"].fillna(0.0).clip(lower=0.0)

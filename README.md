@@ -142,7 +142,19 @@ Key M3L2 configuration:
 - `M3L2_FORECAST_REFRESH_MINUTES`: recurrent cached forecast refresh interval; default `15`.
 - `M3L2_FORECAST_HORIZON_HOURS`: default horizon for recurrent forecast refresh.
 - `M3L2_FORECAST_STEP_MINUTES`: default step for recurrent forecast refresh.
-- `M3L2_MIN_TRAINING_RECORDS`: minimum effective execution records required before training.
+- `M3L2_MIN_TRAINING_RECORDS`: minimum usable site-telemetry records required before training.
+
+Operational training and forecast settings can also be changed at runtime by a `site_admin` from:
+
+```text
+http://localhost:8000/ops/config/ui
+```
+
+The UI exposes non-secret service defaults and per-site overrides: automatic/manual training, training frequency,
+training window, minimum usable telemetry records, forecast horizon/step/refresh cadence, selected model,
+aggregation interval, submission cadence, staleness limits, and minimum coverage. Credentials and infrastructure
+secrets remain server-side. The EIMPS checkbox is shown disabled as "Not yet available"; site registration and
+telemetry submission do not require an EIMPS/MetricsDB execution-record mapping.
 
 Use the CNR/EIMPS ingestion path:
 
@@ -155,8 +167,9 @@ curl -X POST http://localhost:8000/ingest/run \
   -H "Content-Type: application/json" \
   -d '{"start_ts":"2026-01-01T00:00:00Z","end_ts":"2026-01-02T00:00:00Z"}'
 
-# Train manually.
-curl -X POST http://localhost:8000/train
+# Train manually with a site_admin token.
+curl -X POST http://localhost:8000/ops/train \
+  -H "Authorization: Bearer $TOKEN"
 
 # Forecast L2 site-level evidence for the broker. Use a Bearer token from `/auth/token`.
 curl -X POST http://localhost:8000/l2/predict \
@@ -437,7 +450,7 @@ curl -X POST http://localhost/l2/sites/register \
   }'
 ```
 
-For L2 Site Adapter registration, `ri_type` is one of `cloud`, `network`, or `grid`. The registration rule requires the site to match an existing MetricsDB/EIMPS site, or to provide an approved mapping with `metadata.execution_records_site_id`. The current seeded local execution-record site IDs can be checked with:
+For L2 Site Adapter registration, `ri_type` is one of `cloud`, `network`, or `grid`. EIMPS/MetricsDB connection is optional and not yet available in the operator UI, so registration no longer requires a matching execution-record site ID. If an execution-record mapping is known, it can still be kept in `metadata.execution_records_site_id` for prediction ID resolution. The current seeded local execution-record site IDs can be checked with:
 
 ```bash
 docker compose exec postgres psql -U m3l2 -d m3l2 \
@@ -462,6 +475,21 @@ curl http://localhost:8000/l2/sites/SLICES-GR-UTH/availability \
 
 Submitted site-level snapshots store the authenticated submitter email in `site_snapshots.submitted_by_email`.
 Existing rows created before this field was added have `NULL` in that column.
+
+Submitted telemetry is not automatically usable for training just because it was stored. The current training target is
+`l2_site_status`; required inputs are `site_id`, `timestamp`, `operational_status`, `node_availability`,
+`link_availability`, `free_cpu_capacity`, `queue_length`, and `load_index`. Rows are evaluated against the configured
+aggregation interval, submission cadence, staleness limit, minimum usable record count, and minimum coverage. Unknown
+fields remain in `extensions` and are excluded from training until explicitly mapped.
+
+Check readiness and last-run state:
+
+```bash
+curl http://localhost:8000/ops/training/readiness \
+  -H "Authorization: Bearer $TOKEN"
+curl "http://localhost:8000/ops/training/readiness?site_id=SLICES-GR-UTH" \
+  -H "Authorization: Bearer $TOKEN"
+```
 
 Check submitted snapshots in Postgres:
 

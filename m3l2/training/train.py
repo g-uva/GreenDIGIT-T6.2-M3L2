@@ -13,7 +13,7 @@ import pandas as pd
 from sqlalchemy import select
 
 from m3l2.app.config import get_settings
-from m3l2.app.db import ModelRegistry, SessionLocal, SiteStatusSnapshot, create_tables, utc_now
+from m3l2.app.db import ModelRegistry, SessionLocal, SiteStatusSnapshot, TrainingRun, create_tables, utc_now
 from m3l2.training.features import STATUS_FEATURE_COLUMNS, STATUS_TARGET_COLUMNS, build_site_status_training_frame
 
 logger = logging.getLogger(__name__)
@@ -111,86 +111,148 @@ def training_data_fingerprint(df: pd.DataFrame) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def train_model(force: bool = False) -> dict[str, Any]:
+def train_model(force: bool = False, triggered_by_email: str | None = None, site_id: str | None = None) -> dict[str, Any]:
     create_tables()
     settings = get_settings()
     with SessionLocal() as session:
-        df = build_site_status_training_frame(session)
-        if len(df) < settings.min_training_records:
-            return {
-                "status": "not_enough_data",
-                "n_records": len(df),
-                "min_training_records": settings.min_training_records,
-                "target": TARGET,
-                "detail": "Not enough training-compatible L2 site status snapshots are available.",
-            }
+        from m3l2.app.operator_config import IMPLEMENTED_MODEL, effective_config, training_readiness
 
-        fingerprint = training_data_fingerprint(df)
-        active_model = session.execute(
-            select(ModelRegistry).where(ModelRegistry.target == TARGET, ModelRegistry.active.is_(True))
-        ).scalars().first()
-        if not force and active_model and active_model.training_data_fingerprint == fingerprint:
-            return {
-                "status": "skipped_unchanged_data",
-                "model_version": active_model.version,
-                "training_data_fingerprint": fingerprint,
-                "n_records": len(df),
-            }
-
-        df = df.sort_values("timestamp").reset_index(drop=True)
-        val_size = max(1, int(len(df) * 0.2)) if len(df) >= 5 else 0
-        train_df = df.iloc[:-val_size] if val_size else df
-        val_df = df.iloc[-val_size:] if val_size else df.iloc[0:0]
-
-        pipeline = _make_pipeline()
-        pipeline.fit(train_df[FEATURE_COLUMNS], train_df[TARGET_COLUMNS])
-        val_pred = pipeline.predict(val_df[FEATURE_COLUMNS]) if val_size else []
-        metrics = _metrics(val_df[TARGET_COLUMNS], val_pred, len(train_df), len(val_df))
-
-        now = utc_now()
-        version = _version(now)
-        model_dir = Path(settings.model_dir)
-        model_dir.mkdir(parents=True, exist_ok=True)
-        model_path = model_dir / f"{version}.joblib"
-        feature_schema = {
-            "categorical": CATEGORICAL_FEATURES,
-            "numeric": NUMERIC_FEATURES,
-            "target": TARGET,
-            "targets": TARGET_COLUMNS,
-        }
-        joblib.dump({"pipeline": pipeline, "feature_schema": feature_schema, "version": version}, model_path)
-
-        for row in session.execute(
-            select(ModelRegistry).where(ModelRegistry.target == TARGET, ModelRegistry.active.is_(True))
-        ).scalars():
-            row.active = False
-        registry_row = ModelRegistry(
-            model_name="hist_gradient_boosting_mvp",
-            target=TARGET,
-            version=version,
-            path=str(model_path),
-            trained_at=now,
-            training_window_start=df["timestamp"].min().to_pydatetime(),
-            training_window_end=df["timestamp"].max().to_pydatetime(),
-            metrics=metrics,
-            feature_schema=feature_schema,
-            training_data_fingerprint=fingerprint,
-            active=True,
-        )
-        session.add(registry_row)
+        cfg = effective_config(session, site_id)
+        run = TrainingRun(site_id=site_id, status="running", started_at=utc_now(), triggered_by_email=triggered_by_email)
+        session.add(run)
         session.commit()
+        session.refresh(run)
 
-        sites = session.execute(select(SiteStatusSnapshot.site_id).distinct()).scalars().all()
+        def finish(status: str, payload: dict[str, Any], error: str | None = None) -> dict[str, Any]:
+            run.status = status
+            run.finished_at = utc_now()
+            run.model_version = payload.get("model_version")
+            run.detail = payload
+            run.error = error
+            session.commit()
+            return payload
+
+        try:
+            if not force and not bool(cfg["automatic_training"]):
+                return finish(
+                    "skipped",
+                    {
+                        "status": "auto_training_disabled",
+                        "target": TARGET,
+                        "detail": "Automatic training is disabled. Use Train now to run manually.",
+                    },
+                )
+            if cfg["model_name"] != IMPLEMENTED_MODEL:
+                return finish(
+                    "unavailable",
+                    {
+                        "status": "model_unavailable",
+                        "target": TARGET,
+                        "model_name": cfg["model_name"],
+                        "detail": "Selected model is not available.",
+                    },
+                    "Selected model is not available.",
+                )
+
+            readiness = training_readiness(session, site_id)
+            if not readiness["available"]:
+                return finish(
+                    "unavailable",
+                    {
+                        "status": "not_enough_data",
+                        "n_records": readiness["usable_records"],
+                        "min_training_records": cfg["min_usable_records"],
+                        "target": TARGET,
+                        "readiness": readiness,
+                        "detail": "Not enough usable training-compatible L2 site telemetry is available.",
+                    },
+                    readiness["reason"],
+                )
+
+            df = build_site_status_training_frame(session, site_id=site_id)
+            fingerprint = training_data_fingerprint(df)
+            active_model = session.execute(
+                select(ModelRegistry).where(ModelRegistry.target == TARGET, ModelRegistry.active.is_(True))
+            ).scalars().first()
+            if not force and active_model and active_model.training_data_fingerprint == fingerprint:
+                return finish(
+                    "skipped",
+                    {
+                        "status": "skipped_unchanged_data",
+                        "model_version": active_model.version,
+                        "training_data_fingerprint": fingerprint,
+                        "n_records": len(df),
+                    },
+                )
+
+            df = df.sort_values("timestamp").reset_index(drop=True)
+            val_size = max(1, int(len(df) * 0.2)) if len(df) >= 5 else 0
+            train_df = df.iloc[:-val_size] if val_size else df
+            val_df = df.iloc[-val_size:] if val_size else df.iloc[0:0]
+
+            pipeline = _make_pipeline()
+            pipeline.fit(train_df[FEATURE_COLUMNS], train_df[TARGET_COLUMNS])
+            val_pred = pipeline.predict(val_df[FEATURE_COLUMNS]) if val_size else []
+            metrics = _metrics(val_df[TARGET_COLUMNS], val_pred, len(train_df), len(val_df))
+
+            now = utc_now()
+            version = _version(now)
+            model_dir = Path(settings.model_dir)
+            model_dir.mkdir(parents=True, exist_ok=True)
+            model_path = model_dir / f"{version}.joblib"
+            feature_schema = {
+                "categorical": CATEGORICAL_FEATURES,
+                "numeric": NUMERIC_FEATURES,
+                "target": TARGET,
+                "targets": TARGET_COLUMNS,
+                "required_inputs": cfg["required_inputs"],
+                "aggregation_interval_minutes": cfg["aggregation_interval_minutes"],
+                "extensions_training_policy": cfg["extensions_training_policy"],
+            }
+            joblib.dump({"pipeline": pipeline, "feature_schema": feature_schema, "version": version}, model_path)
+
+            for row in session.execute(
+                select(ModelRegistry).where(ModelRegistry.target == TARGET, ModelRegistry.active.is_(True))
+            ).scalars():
+                row.active = False
+            registry_row = ModelRegistry(
+                model_name=cfg["model_name"],
+                target=TARGET,
+                version=version,
+                path=str(model_path),
+                trained_at=now,
+                training_window_start=df["timestamp"].min().to_pydatetime(),
+                training_window_end=df["timestamp"].max().to_pydatetime(),
+                metrics=metrics,
+                feature_schema=feature_schema,
+                training_data_fingerprint=fingerprint,
+                active=True,
+            )
+            session.add(registry_row)
+            session.commit()
+
+            sites = [site_id] if site_id else session.execute(select(SiteStatusSnapshot.site_id).distinct()).scalars().all()
+        except Exception as exc:
+            logger.exception("Training failed")
+            return finish(
+                "error",
+                {"status": "training_failed", "target": TARGET, "detail": str(exc)},
+                str(exc),
+            )
 
     forecast_status = "skipped"
     if sites:
         from m3l2.inference.forecast_refresh import refresh_forecasts
 
-        result = refresh_forecasts(site_ids=[site for site in sites if site], force=True)
-        forecast_status = result.get("status", "stored")
+        try:
+            result = refresh_forecasts(site_ids=[site for site in sites if site], force=True)
+            forecast_status = result.get("status", "stored")
+        except Exception as exc:
+            logger.exception("Forecast refresh after training failed")
+            forecast_status = f"error: {exc}"
 
     logger.info("Training completed for %s with metrics %s", version, metrics)
-    return {
+    result = {
         "status": "trained",
         "target": TARGET,
         "model_version": version,
@@ -198,4 +260,15 @@ def train_model(force: bool = False) -> dict[str, Any]:
         "metrics": metrics,
         "training_data_fingerprint": fingerprint,
         "forecast_status": forecast_status,
+        "n_records": len(df),
+        "readiness": readiness,
     }
+    with SessionLocal() as session:
+        row = session.get(TrainingRun, run.id)
+        if row is not None:
+            row.status = "trained"
+            row.finished_at = utc_now()
+            row.model_version = version
+            row.detail = result
+            session.commit()
+    return result

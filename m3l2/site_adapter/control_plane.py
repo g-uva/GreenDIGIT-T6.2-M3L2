@@ -6,11 +6,11 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from m3l2.app.config import get_settings
-from m3l2.app.db import ExecutionRecord, RegisteredSite, SessionLocal, SiteSnapshot, SiteStatusSnapshot, utc_now
+from m3l2.app.db import RegisteredSite, SessionLocal, SiteSnapshot, SiteStatusSnapshot, utc_now
 from m3l2.ingestion.site_adapter import normalise_site_status
 from m3l2.site_adapter.auth import SitePrincipal, current_principal, require_roles, require_same_site
 from m3l2.site_adapter.client import SiteAdapterClient
@@ -112,25 +112,6 @@ def _load_site(session: Session, site_id: str) -> RegisteredSite:
     return site
 
 
-def _execution_site_exists(session: Session, site_id: str | None) -> bool:
-    if not site_id:
-        return False
-    count = session.scalar(select(func.count()).select_from(ExecutionRecord).where(ExecutionRecord.site_id == site_id))
-    return bool(count)
-
-
-def _registration_matches_known_site(session: Session, payload: SiteRegistrationRequest) -> bool:
-    metadata = payload.metadata or {}
-    candidates = {
-        payload.site_id,
-        payload.site_name,
-        metadata.get("eimps_site_name"),
-        metadata.get("metricsdb_site_id"),
-        metadata.get("execution_records_site_id"),
-    }
-    return any(_execution_site_exists(session, str(candidate)) for candidate in candidates if candidate)
-
-
 def _auth_config(payload: SiteRegistrationRequest) -> dict[str, Any]:
     if payload.auth_type == "egi_checkin":
         settings = get_settings()
@@ -221,11 +202,6 @@ def register_site(
     session: Session = Depends(get_db),
 ) -> dict[str, Any]:
     require_same_site(principal, payload.site_id)
-    if not _registration_matches_known_site(session, payload):
-        raise HTTPException(
-            status_code=400,
-            detail="site_id must match an existing MetricsDB/EIMPS site or provide approved mapping",
-        )
 
     existing = session.execute(select(RegisteredSite).where(RegisteredSite.site_id == payload.site_id)).scalar_one_or_none()
     values = {

@@ -13,6 +13,7 @@ from m3l2.app.db import (
     ExecutionRecord,
     ForecastCache,
     ModelRegistry,
+    OperatorConfig,
     RegisteredSite,
     SessionLocal,
     SiteProfile,
@@ -70,10 +71,13 @@ def _seed_records(count: int = 8) -> None:
                     ri_type="cloud",
                     timestamp=base + timedelta(hours=count),
                     operational_status="UP",
+                    node_availability=1.0,
+                    link_availability=1.0,
                     free_cpu_capacity=16,
                     free_gpu_capacity=1,
                     queue_length=1,
                     provisioning_delay_s=30,
+                    load_index=0.2,
                     carbon_intensity=250,
                 )
             )
@@ -96,6 +100,14 @@ def _prepare_training(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("M3L2_FORECAST_STEP_MINUTES", "60")
     monkeypatch.setenv("M3L2_FORECAST_HORIZON_HOURS", "2")
     _seed_records()
+    with SessionLocal() as session:
+        session.add(
+            OperatorConfig(
+                config_key="service",
+                settings={"submission_cadence_minutes": 120, "minimum_coverage_ratio": 0.5},
+            )
+        )
+        session.commit()
 
 
 def _predict_payload(workload_id: str = "wl-1") -> dict[str, Any]:

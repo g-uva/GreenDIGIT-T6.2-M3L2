@@ -6,7 +6,6 @@ from typing import Any
 
 from sqlalchemy import select
 
-from m3l2.app.config import get_settings
 from m3l2.app.db import ExecutionRecord, SessionLocal, SiteProfile, SiteSnapshot, SiteStatusSnapshot, create_tables, utc_now
 from m3l2.app.schemas import PredictRequest
 from m3l2.inference.predict import predict
@@ -29,20 +28,24 @@ def _known_site_ids() -> list[str]:
 
 def refresh_forecasts(site_ids: list[str] | None = None, force: bool = True) -> dict[str, Any]:
     create_tables()
-    settings = get_settings()
     sites = list(dict.fromkeys(site_ids or _known_site_ids()))
     if not sites:
         return {"status": "no_sites", "refreshed": 0}
 
-    step_minutes = max(int(settings.forecast_step_minutes), 1)
+    with SessionLocal() as session:
+        from m3l2.app.operator_config import effective_config
+
+        cfg = effective_config(session)
+
+    step_minutes = max(int(cfg["forecast_step_minutes"]), 1)
     forecast_start = utc_now().replace(second=0, microsecond=0)
     forecast_start = forecast_start - timedelta(minutes=forecast_start.minute % step_minutes)
     request = PredictRequest(
         request_id=f"forecast-refresh-{forecast_start.isoformat()}",
         candidate_site_ids=sites,
         forecast_start_time=forecast_start,
-        horizon=f"{settings.forecast_horizon_hours}h",
-        step=f"{settings.forecast_step_minutes}m",
+        horizon=f"{cfg['forecast_horizon_hours']}h",
+        step=f"{cfg['forecast_step_minutes']}m",
         cache={"use_cache": not force},
         include_site_status=True,
     )
