@@ -33,7 +33,7 @@ def read_site_inputs(path: Path) -> tuple[dict[str, dict], datetime]:
 
 
 def profile_for(site_id: str, index: int, max_ncores: float) -> dict:
-    ri_types = ["iot", "cloud", "grid"]
+    ri_types = ["network", "cloud", "grid"]
     ri_type = ri_types[index % len(ri_types)]
     compute_capacity = max(32.0, math.ceil(max_ncores * 1.25 / 16.0) * 16.0)
     gpu_capacity = 4.0 if ri_type == "cloud" else 1.0 if ri_type == "grid" else 0.0
@@ -44,7 +44,7 @@ def profile_for(site_id: str, index: int, max_ncores: float) -> dict:
         "compute_capacity": compute_capacity,
         "gpu_capacity": gpu_capacity,
         "storage_capacity": 2048.0 + index * 1024.0,
-        "network_topology": "Mesh" if ri_type == "iot" else "Hybrid",
+        "network_topology": "Mesh" if ri_type == "network" else "Hybrid",
         "link_capacities": {"uplink_mbps": 1000 + index * 500},
         "supported_workload_types": ["batch", "stream", "ml"] if ri_type != "grid" else ["batch", "cpu"],
         "energy_capabilities": {"metering": "mock", "cpu": True, "gpu": gpu_capacity > 0},
@@ -148,4 +148,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

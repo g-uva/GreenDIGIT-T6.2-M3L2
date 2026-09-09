@@ -10,7 +10,8 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from m3l2.app.config import get_settings
-from m3l2.app.db import ExecutionRecord, RegisteredSite, SessionLocal, SiteSnapshot, utc_now
+from m3l2.app.db import ExecutionRecord, RegisteredSite, SessionLocal, SiteSnapshot, SiteStatusSnapshot, utc_now
+from m3l2.ingestion.site_adapter import normalise_site_status
 from m3l2.site_adapter.auth import SitePrincipal, current_principal, require_roles, require_same_site
 from m3l2.site_adapter.client import SiteAdapterClient
 from m3l2.site_adapter.schemas import SiteRegistrationRequest, SiteSnapshotIn, WorkloadSubmissionRequest
@@ -33,6 +34,8 @@ def model_dump(model: Any) -> dict[str, Any]:
 
 def _to_utc(value: datetime | None = None) -> datetime:
     value = value or utc_now()
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
@@ -80,6 +83,24 @@ def latest_snapshot(session: Session, site_id: str) -> SiteSnapshot | None:
     return session.execute(
         select(SiteSnapshot).where(SiteSnapshot.site_id == site_id).order_by(desc(SiteSnapshot.ts), desc(SiteSnapshot.id))
     ).scalars().first()
+
+
+def _snapshot_status_payload(site_id: str, payload: dict[str, Any], ts: datetime | None) -> dict[str, Any]:
+    status_ts = ts or payload.get("ts") or payload.get("timestamp")
+    return {
+        **{
+            key: value
+            for key, value in payload.items()
+            if key not in {"ts", "timestamp", "capabilities", "availability", "usage", "efficiency", "status", "quality"}
+        },
+        "site_id": site_id,
+        "timestamp": status_ts,
+        **(payload.get("availability") or {}),
+        **(payload.get("usage") or {}),
+        **(payload.get("efficiency") or {}),
+        **(payload.get("status") or {}),
+        **(payload.get("quality") or {}),
+    }
 
 
 def _load_site(session: Session, site_id: str) -> RegisteredSite:
@@ -145,6 +166,14 @@ def store_snapshot(
         raw_json=jsonable_encoder(raw_json if raw_json is not None else payload),
     )
     session.add(snapshot)
+    try:
+        status = normalise_site_status(_snapshot_status_payload(site_id, payload, ts))
+    except ValueError:
+        status = None
+    if status is not None:
+        status.pop("_warnings", None)
+        status["raw_json"] = jsonable_encoder({"source_schema": "l2_site_snapshot", **(raw_json if raw_json is not None else payload)})
+        session.add(SiteStatusSnapshot(**status, ingested_at=utc_now()))
     site = session.execute(select(RegisteredSite).where(RegisteredSite.site_id == site_id)).scalar_one_or_none()
     if site:
         site.last_seen_at = utc_now()
@@ -254,12 +283,13 @@ def push_snapshot(
     require_same_site(principal, site_id)
     _load_site(session, site_id)
     body = model_dump(payload)
+    snapshot_ts = payload.ts or body.get("timestamp")
     snapshot = store_snapshot(
         session,
         site_id,
         body,
         source="push",
-        ts=payload.ts,
+        ts=snapshot_ts,
         raw_json=body,
         submitted_by_email=principal.email,
     )

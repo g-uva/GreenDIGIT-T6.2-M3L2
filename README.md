@@ -38,9 +38,11 @@ Deployed as part of the **GreenDIGIT WP6.2** research activities, this module in
 - [ ] (Optional) Testbed implementation IoT with UTH
 - M3L2 MVP inference-serving path.
   - [x] Typed broker-facing prediction schema
+  - [x] Authenticated `/l2/predict` endpoint for L2 site-level forecast evidence
   - [x] Recurrent batch forecast refresh
   - [x] Idempotent training and workload-aware caching
   - [x] Basic HGBR baseline
+  - [ ] Connect live EIMPS/MetricsDB execution-unit records ingestion
   - [ ] Add an operator workflow to register/configure a site before it is used for training
   - [ ] Add a DB-backed per-site training/forecast configuration, including whether each site is enabled, its characteristics, targets, minimum data requirements and any feature overrides
   - [ ] Evaluate model accuracy and compare HGBR, XGBoost, LSTM and ARIMA
@@ -87,36 +89,18 @@ curl http://localhost:8000/model
 ```
 
 ### 3) Request a prediction
-If the champion is **XGBoost/HGBR (tabular)**, send a flat feature dict.
+For the M3L2 EUR-facing API, use the authenticated `/l2/predict` endpoint. Older model-specific prediction routes are compatibility-only and are hidden from the OpenAPI docs.
 ```bash
-curl -X POST http://localhost:8000/predict \
+curl -X POST http://localhost:8000/l2/predict \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
-        "features": {
-          "cpu_usage_percent": 12.3,
-          "memory_used_bytes": 8200000000,
-          "network_bw_rx_b/s": 155000,
-          "lag_1h": 320.5,
-          "lag_2h": 315.1,
-          "lag_3h": 318.9,
-          "lag_6h": 310.2
-        }
+        "site_ids": ["SLICES-GR-UTH"],
+        "horizon": "24h",
+        "step": "1h",
+        "workload": {"class": "batch", "cpu_hours": 8},
+        "use_cache": true
       }'
-# → {"power_forecast": <number>}
-```
-If the "champion" is **LSTM (sequence)**, send the most recent window `[timesteps]` `[features]`.
-```bash
-curl -X POST http://localhost:8000/predict \
-  -H 'Content-Type: application/json' \
-  -d '{
-        "window": [
-          [12.3, 8200000000, 155000, ...],
-          [13.1, 8300000000, 160000, ...],
-          [11.9, 8100000000, 150000, ...]
-          // ... up to the configured window length (e.g., 60 steps)
-        ]
-      }'
-# → {"power_forecast": <number>}
 ```
 
 #### Notes
@@ -129,7 +113,7 @@ mes server-side before padding missing inputs.
 
 ## Metrics Ingestion Services (Features)
 - Ingest, Featurise and Train stages in-built as a pipeline (with DVC tracking).
-- FastAPI server `/predict` endpoint with a `{"power_forecast":<number>}` result.
+- FastAPI server with hidden compatibility prediction routes and the M3L2 `/l2/predict` endpoint for EUR-facing forecasts.
 - MQTT + Kafka + Flink streaming pipeline
 
 ## M3L2 MVP Production Path
@@ -138,8 +122,8 @@ The scoped MVP lives under `m3l2/`. It does four things:
 
 - fetches execution records from CNR MetricsDB/EIMPS;
 - stores normalised execution records plus Site Adapter profile/status snapshots in SQL;
-- trains an `energy_wh` model every 6 hours;
-- serves energy, generic efficiency, and dynamic site-status forecasts through FastAPI.
+- trains an `l2_site_status` model from training-compatible L2 Site Adapter status data every 6 hours;
+- serves inferred availability, free resources, queue/provisioning delay, maintenance, and feasibility forecasts through FastAPI.
 - exposes an EIMPS-style login page for 24-hour JWT tokens.
 
 Run it:
@@ -174,8 +158,9 @@ curl -X POST http://localhost:8000/ingest/run \
 # Train manually.
 curl -X POST http://localhost:8000/train
 
-# Forecast site energy.
-curl -X POST http://localhost:8000/predict \
+# Forecast L2 site-level evidence for the broker. Use a Bearer token from `/auth/token`.
+curl -X POST http://localhost:8000/l2/predict \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "request_id": "broker-req-001",
@@ -224,23 +209,34 @@ Concise typed response shape:
   "generated_at": "2026-09-07T12:00:03Z",
   "valid_until": "2026-09-07T13:00:00Z",
   "model_name": "hist_gradient_boosting_mvp",
-  "model_version": "energy-wh-20260907T115900000000",
+  "model_version": "l2-site-status-20260907T115900000000",
+  "target": "l2_site_status",
   "forecast_start_time": "2026-09-07T12:00:00Z",
   "horizon": "2h",
   "step": "1h",
   "results": [
     {
       "site_id": "SLICES-GR-UTH",
-      "target": "energy_wh",
-      "energy_forecast": [
-        {"ts": "2026-09-07T13:00:00Z", "value": 42.0, "unit": "Wh"}
+      "target": "l2_site_status",
+      "forecast": [
+        {"ts": "2026-09-07T13:00:00Z", "value": 0.98, "unit": "ratio"}
+      ],
+      "energy_forecast": [],
+      "site_status_forecast": [
+        {
+          "ts": "2026-09-07T13:00:00Z",
+          "operational_status": "UP",
+          "availability": 0.98,
+          "free_cpu_capacity": 16,
+          "queue_length": 1,
+          "provisioning_delay_s": 30,
+          "maintenance_flag": false,
+          "inference_source": "model"
+        }
       ],
       "capacity": {"compute_capacity": 32, "free_cpu_capacity": 16},
       "feasibility": {"status": "feasible", "reasons": []},
-      "workload_estimates": {
-        "expected_workload_energy_wh": 84.0,
-        "expected_workload_carbon_g": 21.0
-      },
+      "workload_estimates": {},
       "quality": {"forecast_quality": "baseline", "freshness": "cached", "confidence": "low"},
       "warnings": []
     }
@@ -249,7 +245,7 @@ Concise typed response shape:
 }
 ```
 
-If cached forecasts are absent or stale for the normalised workload signature, `/predict` refreshes them with the active model and returns `cached_forecast_absent_refreshed` or `cached_forecast_stale_refreshed` in `warnings`. If no active model is registered, `/predict` and `/predict/batch` return `503`; malformed typed workload/time/resource inputs return validation errors.
+If cached forecasts are absent or stale for the normalised workload signature, `/l2/predict` refreshes them with the active `l2_site_status` model and returns `cached_forecast_absent_refreshed` or `cached_forecast_stale_refreshed` in `warnings`. If no active model is registered, `/l2/predict` returns `503`; malformed typed workload/time/resource inputs return validation errors. Legacy prediction endpoints remain callable for compatibility but are hidden from the API docs.
 Registered operator-facing site IDs such as `SLICES-GR-UTH` are resolved through `registered_sites.metadata.execution_records_site_id` before model inference. Responses include both `site_id` and `training_site_id`; unknown candidate sites return a clear `candidate_sites_not_found` response.
 
 ### L2 Site Adapter login and tokens
@@ -296,18 +292,19 @@ For local validation, `raw_data/summary_sites_15m.csv` is a 15-minute aggregate,
 bucket_15m,site_id,vo,activity,records,energy_wh,cfp_g,work,ncores
 ```
 
-Load those aggregate rows into synthetic `execution_records` and trigger training:
+Load those aggregate rows into synthetic `execution_records`, derive training-compatible L2 site-status rows, and trigger training:
 
 ```bash
 docker compose exec api python scripts/load_raw_aggregate_and_train.py
 ```
 
-This stores the rows with `status="aggregated"` and `raw_json.source_file="raw_data/summary_sites_15m.csv"`.
+This stores the rows with `status="aggregated"` and `raw_json.source_file="raw_data/summary_sites_15m.csv"`. L2 Site Adapter snapshots submitted through `/l2/sites/{site_id}/snapshots` are also converted into training-compatible status rows automatically.
 
 Forecast after training:
 
 ```bash
-curl -X POST http://localhost:8000/predict \
+curl -X POST http://localhost:8000/l2/predict \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"site_ids":null,"horizon":"24h","step":"1h","workload":{"class":"batch","cpu_hours":8},"use_cache":true}'
 ```
@@ -315,7 +312,8 @@ curl -X POST http://localhost:8000/predict \
 Format the response with `jq`:
 
 ```bash
-curl -s -X POST http://localhost:8000/predict \
+curl -s -X POST http://localhost:8000/l2/predict \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"site_ids":null,"horizon":"24h","step":"1h","workload":{"class":"batch","cpu_hours":8},"use_cache":true}' \
   | jq .
@@ -324,22 +322,24 @@ curl -s -X POST http://localhost:8000/predict \
 Brokering-oriented view:
 
 ```bash
-curl -s -X POST http://localhost:8000/predict \
+curl -s -X POST http://localhost:8000/l2/predict \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"site_ids":null,"horizon":"24h","step":"1h","workload":{"class":"batch","cpu_hours":8},"use_cache":true}' \
   | jq '.predictions[] | {
       site_id,
-      energy_forecast: .forecast,
-      status: .site_status_forecast,
-      efficiency
+      inferred_availability: .forecast,
+      inferred_status: .site_status_forecast,
+      capacity,
+      feasibility
     }'
 ```
 
 Prediction responses include:
 
-- `forecast`: expected `energy_wh` over the requested horizon.
-- `site_status_forecast`: persistence baseline for availability/free capacity, queue/provisioning delay, maintenance flag, and operational state.
-- `efficiency`: expected energy per CPU-hour/GPU-hour and workload-class energy/carbon when workload descriptors are supplied.
+- `forecast`: inferred availability ratio over the requested horizon.
+- `site_status_forecast`: model-inferred availability/free capacity, queue/provisioning delay, maintenance flag, and operational state.
+- `capacity` and `feasibility`: broker-facing resource evidence derived from the inferred L2 forecast.
 
 Mock Site Adapter availability data is available for local tests:
 
@@ -365,12 +365,18 @@ Publish generic Site Adapter data directly:
 ```bash
 curl -X POST "http://localhost:8000/site-profiles?adapter_type=iot" \
   -H "Content-Type: application/json" \
-  -d '{"site_id":"SLICES-GR-UTH","location":"UTH","compute_capacity":32,"network_topology":"Mesh"}'
+  -d '{"site_id":"SLICES-GR-UTH","ri_type":"network","location":"UTH","compute_capacity":32,"network_topology":"Mesh"}'
 
 curl -X POST "http://localhost:8000/site-status?adapter_type=openstack" \
   -H "Content-Type: application/json" \
   -d '{"site_id":"OPENSTACK-DEMO","timestamp":"2026-01-01T00:00:00Z","total_vcpus":256,"free_vcpus":120,"total_gpus":8,"free_gpus":2,"pending_vms":4,"vm_provisioning_delay_s":180}'
 ```
+
+`adapter_type` only selects supported input aliases (`generic`, `iot`, or `openstack`); it does not classify the
+resource infrastructure. Use `ri_type` independently with one of `network`, `cloud`, or `grid` when the
+classification is known. The submission endpoints validate the full batch before writing, return HTTP 422 with
+field-specific errors for invalid values or conflicting aliases, and preserve unmapped fields in `extensions` with
+submission warnings.
 
 ### Built-in mock L3 Site Adapter
 

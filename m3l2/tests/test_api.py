@@ -3,8 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
-from m3l2.app.db import AuthUser, RegisteredSite, SessionLocal, SiteSnapshot
+from m3l2.app.db import AuthUser, RegisteredSite, SessionLocal, SiteProfile, SiteSnapshot, SiteStatusSnapshot
 from m3l2.app.main import app
 from m3l2.site_adapter.auth import create_site_jwt
 
@@ -23,6 +24,23 @@ def test_predict_no_active_model(temp_database, monkeypatch):
         response = client.post("/predict", json={"site_ids": None, "horizon": "24h", "step": "1h", "use_cache": True})
     assert response.status_code == 503
     assert response.json()["status"] == "no_active_model"
+
+
+def test_legacy_predict_routes_are_hidden_from_openapi(temp_database, monkeypatch):
+    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
+    with TestClient(app) as client:
+        schema = client.get("/openapi.json").json()
+
+    assert "/l2/predict" in schema["paths"]
+    assert "/predict" not in schema["paths"]
+    assert "/predict/batch" not in schema["paths"]
+    operation_tags = [
+        tag
+        for path in schema["paths"].values()
+        for operation in path.values()
+        for tag in operation.get("tags", ["default"])
+    ]
+    assert "default" not in operation_tags
 
 
 def _seed_site() -> None:
@@ -84,6 +102,7 @@ def test_l2_site_adapter_endpoints_require_bearer_token(temp_database, monkeypat
 
     with TestClient(app) as client:
         checks = [
+            client.post("/l2/predict", json={"site_ids": ["SLICES-GR-UTH"], "horizon": "1h", "step": "1h"}),
             client.get("/l2/sites"),
             client.get("/l2/sites/SLICES-GR-UTH"),
             client.get("/l2/sites/SLICES-GR-UTH/latest"),
@@ -98,6 +117,21 @@ def test_l2_site_adapter_endpoints_require_bearer_token(temp_database, monkeypat
         ]
 
     assert {response.status_code for response in checks} == {401}
+
+
+def test_l2_predict_requires_model_after_bearer_token(temp_database, monkeypatch):
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    _seed_site()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/l2/predict",
+            headers=_auth_header(),
+            json={"site_ids": ["SLICES-GR-UTH"], "horizon": "1h", "step": "1h"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "no_active_model"
 
 
 def test_l2_site_reads_return_authenticated_site_data(temp_database, monkeypatch):
@@ -148,3 +182,190 @@ def test_snapshot_submission_records_submitter_email(temp_database, monkeypatch)
 
     assert response.status_code == 200
     assert response.json()["submitted_by_email"] == "publisher@uth.gr"
+    with SessionLocal() as session:
+        status = session.execute(
+            select(SiteStatusSnapshot)
+            .where(SiteStatusSnapshot.site_id == "SLICES-GR-UTH")
+            .order_by(SiteStatusSnapshot.timestamp.desc())
+        ).scalars().first()
+
+    assert status is not None
+    assert status.operational_status == "UP"
+    assert status.load_index == 0.2
+
+
+def test_flat_uth_snapshot_submission_is_training_compatible(temp_database, monkeypatch):
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    _seed_site()
+
+    payload = {
+        "timestamp": "2026-09-07T01:00:00Z",
+        "ri_type": "Grid",
+        "operational_status": "DEGRADED",
+        "maintenance_flag": False,
+        "node_availability": 0.95,
+        "link_availability": 0.98,
+        "cpu_util_avg": 72.0,
+        "queue_length": 3,
+        "remaining_jobs": 8,
+        "load_index": 0.7,
+        "energy_consumed": 100.0,
+        "pue_estimate": 1.2,
+        "carbon_intensity": 250.0,
+        "update_frequency": 3600,
+        "data_confidence": 0.9,
+        "coverage_ratio": 0.95,
+        "stale_flag": False,
+    }
+    with TestClient(app) as client:
+        response = client.post(
+            "/l2/sites/SLICES-GR-UTH/snapshots",
+            headers=_auth_header("publisher@uth.gr", role="publisher"),
+            json=payload,
+        )
+
+    assert response.status_code == 200
+    assert response.json()["ts"] == "2026-09-07T01:00:00+00:00"
+    with SessionLocal() as session:
+        status = session.execute(
+            select(SiteStatusSnapshot)
+            .where(SiteStatusSnapshot.site_id == "SLICES-GR-UTH")
+            .order_by(SiteStatusSnapshot.timestamp.desc())
+        ).scalars().first()
+
+    assert status is not None
+    assert status.ri_type == "grid"
+    assert status.operational_status == "DEGRADED"
+    assert status.node_availability == 0.95
+    assert status.queue_length == 3
+
+
+def test_site_status_batch_validation_prevents_partial_persistence(temp_database, monkeypatch):
+    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
+    payload = [
+        {
+            "site_id": "SITE-OK",
+            "ri_type": "grid",
+            "timestamp": "2026-09-08T07:00:00Z",
+            "node_availability": 0.9,
+        },
+        {
+            "site_id": "SITE-BAD",
+            "ri_type": "grid",
+            "node_availability": 1.2,
+        },
+    ]
+
+    with TestClient(app) as client:
+        response = client.post("/site-status", json=payload)
+
+    assert response.status_code == 422
+    fields = {tuple(error["loc"]) for error in response.json()["detail"]}
+    assert ("body", 1, "timestamp") in fields
+    assert ("body", 1, "node_availability") in fields
+    with SessionLocal() as session:
+        count = session.query(SiteStatusSnapshot).count()
+    assert count == 0
+
+
+def test_site_profile_alias_conflict_returns_field_error(temp_database, monkeypatch):
+    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
+    payload = {
+        "site_id": "SLICES-GR-UTH",
+        "site": "OTHER-SITE",
+        "ri_type": "grid",
+    }
+
+    with TestClient(app) as client:
+        response = client.post("/site-profiles?adapter_type=iot", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "site_id"]
+    with SessionLocal() as session:
+        count = session.query(SiteProfile).count()
+    assert count == 0
+
+
+def test_profile_extensions_are_warned_and_returned(temp_database, monkeypatch):
+    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
+    payload = {
+        "site_id": "SLICES-GR-UTH",
+        "ri_type": "grid",
+        "location": "UTH",
+        "local_owner": "uth",
+        "extensions": {"sensor_generation": "v2"},
+    }
+
+    with TestClient(app) as client:
+        submit = client.post("/site-profiles", json=payload)
+        listed = client.get("/site-profiles")
+
+    assert submit.status_code == 200
+    assert submit.json()["warnings"] == [{"index": 0, "fields": ["local_owner", "sensor_generation"]}]
+    profile = listed.json()[0]
+    assert profile["extensions"] == {"local_owner": "uth", "sensor_generation": "v2"}
+
+
+def test_iot_status_round_trip_preserves_uth_fields_and_zero_false_values(temp_database, monkeypatch):
+    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
+    payload = {
+        "site": "SLICES-GR-UTH",
+        "ri_type": "network",
+        "ts": "2026-09-08T07:00:00Z",
+        "alive_nodes": 0,
+        "total_nodes": 10,
+        "active_links": 0,
+        "total_links": 5,
+        "cpu_utilization": 0,
+        "stability": 1.0,
+        "stale": False,
+        "lab_phase": "pilot",
+    }
+
+    with TestClient(app) as client:
+        submit = client.post("/site-status?adapter_type=iot", json=payload)
+        latest = client.get("/site-status/latest?site_id=SLICES-GR-UTH")
+
+    assert submit.status_code == 200
+    assert submit.json()["warnings"] == [{"index": 0, "fields": ["lab_phase"]}]
+    status = latest.json()[0]
+    assert status["ri_type"] == "network"
+    assert status["node_availability"] == 0.0
+    assert status["link_availability"] == 0.0
+    assert status["cpu_util_avg"] == 0.0
+    assert status["stability_score"] == 1.0
+    assert status["stale_flag"] is False
+    assert status["extensions"] == {"lab_phase": "pilot"}
+
+
+def test_iot_status_rejects_conflicting_explicit_and_derived_availability(temp_database, monkeypatch):
+    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
+    payload = {
+        "site_id": "SLICES-GR-UTH",
+        "ri_type": "network",
+        "timestamp": "2026-09-08T07:00:00Z",
+        "node_availability": 0.5,
+        "alive_nodes": 9,
+        "total_nodes": 10,
+    }
+
+    with TestClient(app) as client:
+        response = client.post("/site-status?adapter_type=iot", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "node_availability"]
+
+
+def test_iot_adapter_does_not_accept_iot_as_ri_type(temp_database, monkeypatch):
+    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
+    payload = {
+        "site_id": "SLICES-GR-UTH",
+        "ri_type": "iot",
+        "timestamp": "2026-09-08T07:00:00Z",
+    }
+
+    with TestClient(app) as client:
+        response = client.post("/site-status?adapter_type=iot", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "ri_type"]

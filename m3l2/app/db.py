@@ -52,6 +52,7 @@ class SiteProfile(Base):
     supported_workload_types: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     energy_capabilities: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     static_pue_baseline: Mapped[float | None] = mapped_column(Float, nullable=True)
+    extensions: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     raw_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
@@ -89,6 +90,7 @@ class SiteStatusSnapshot(Base):
     data_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     coverage_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
     stale_flag: Mapped[bool] = mapped_column(Boolean, default=False)
+    extensions: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     raw_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
@@ -211,6 +213,8 @@ def create_tables() -> None:
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
     _ensure_site_snapshot_columns(engine)
+    _ensure_site_profile_columns(engine)
+    _ensure_site_status_columns(engine)
     _ensure_model_registry_columns(engine)
     _ensure_forecast_cache_columns(engine)
 
@@ -221,6 +225,26 @@ def _ensure_site_snapshot_columns(engine: Engine) -> None:
         return
     with engine.begin() as connection:
         connection.execute(text("ALTER TABLE site_snapshots ADD COLUMN submitted_by_email VARCHAR"))
+
+
+def _json_column_type(engine: Engine) -> str:
+    return "JSONB" if engine.dialect.name == "postgresql" else "JSON"
+
+
+def _ensure_site_profile_columns(engine: Engine) -> None:
+    columns = {column["name"] for column in inspect(engine).get_columns("site_profiles")}
+    if "extensions" in columns:
+        return
+    with engine.begin() as connection:
+        connection.execute(text(f"ALTER TABLE site_profiles ADD COLUMN extensions {_json_column_type(engine)}"))
+
+
+def _ensure_site_status_columns(engine: Engine) -> None:
+    columns = {column["name"] for column in inspect(engine).get_columns("site_status_snapshots")}
+    if "extensions" in columns:
+        return
+    with engine.begin() as connection:
+        connection.execute(text(f"ALTER TABLE site_status_snapshots ADD COLUMN extensions {_json_column_type(engine)}"))
 
 
 def _ensure_model_registry_columns(engine: Engine) -> None:

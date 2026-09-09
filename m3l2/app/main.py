@@ -3,10 +3,10 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import Body, Depends, FastAPI, HTTPException
+from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import desc, func, select
@@ -31,7 +31,8 @@ from m3l2.broker_mock.router import router as mock_broker_router
 from m3l2.inference.forecast_refresh import refresh_forecasts
 from m3l2.inference.predict import predict as run_predict, predict_many
 from m3l2.ingestion.jobs import run_ingestion
-from m3l2.ingestion.site_adapter import normalise_site_profile, normalise_site_status
+from m3l2.ingestion.site_adapter import SiteAdapterValidationError, normalise_site_profile, normalise_site_status
+from m3l2.site_adapter.auth import SitePrincipal, current_principal
 from m3l2.site_adapter.control_plane import router as site_adapter_router
 from m3l2.site_adapter.mock_l3 import router as mock_l3_router
 from m3l2.training.registry import get_active_model, get_model_by_version, list_models, serialise_model
@@ -63,6 +64,199 @@ def _serialise_dt(value: Any) -> Any:
 
 def _serialise_row(row: Any) -> dict[str, Any]:
     return {column.name: _serialise_dt(getattr(row, column.name)) for column in row.__table__.columns}
+
+
+def _submission_errors(errors: list[dict[str, Any]], index: int | None = None) -> list[dict[str, Any]]:
+    prefix: list[Any] = ["body"] if index is None else ["body", index]
+    return [{**error, "loc": prefix + list(error.get("loc", []))} for error in errors]
+
+
+def _warnings(index: int, profile_or_status: dict[str, Any]) -> dict[str, Any] | None:
+    fields = profile_or_status.pop("_warnings", [])
+    if not fields:
+        return None
+    return {"index": index, "fields": fields}
+
+
+PROFILE_SUBMISSION_DESCRIPTION = """
+Submit one static site profile object or a batch of profile objects. The API maps canonical fields and supported
+aliases into the static profile schema before persistence, rejects conflicting aliases, and preserves unrecognised
+fields in `extensions`.
+
+Required: `site_id`.
+Optional: `ri_type` (`network`, `cloud`, `grid`; omitted values persist as `unknown`), `location`,
+`compute_capacity` (CPU cores/vCPUs or adapter-native compute units, >= 0), `gpu_capacity` (GPUs, >= 0),
+`storage_capacity` (GB, >= 0), `network_topology`, `link_capacities` object,
+`supported_workload_types` string list, `energy_capabilities` object, and `static_pue_baseline` (PUE, >= 1).
+
+Aliases: generic/IoT `site`, `site_name`, `pue`; IoT `facility`, `total_nodes`, `node_count`, `topology`;
+OpenStack `cloud_name`, `name`, `region_name`, `availability_zone`, `total_vcpus`, `vcpus_total`,
+`cpu_capacity`, `total_gpus`, `gpus_total`, `total_disk_gb`, `disk_gb_total`.
+
+Validation: invalid types, enum values, ranges, missing identity, and alias conflicts return HTTP 422 with
+field-specific `detail` entries. Unknown fields are returned in submission warnings and stored in `extensions`;
+extensions are not used by training or prediction until explicitly mapped.
+"""
+
+
+STATUS_SUBMISSION_DESCRIPTION = """
+Submit one dynamic site status object or a batch of status objects. The API maps canonical fields and supported
+aliases into the dynamic metrics schema before persistence, rejects conflicting aliases, and preserves unrecognised
+fields in `extensions`.
+
+Required: `site_id`, `timestamp` (explicit ISO-8601 timestamp).
+Optional: `ri_type` (`network`, `cloud`, `grid`; omitted values persist as `unknown`), `operational_status`
+(`UP`, `DOWN`, `DEGRADED`, `MAINTENANCE`), `maintenance_flag`, `scheduled_maintenance` object,
+`node_availability` and `link_availability` ratios (0..1), `stability_score` (0..1), `packet_loss` (% 0..100),
+`network_jitter` (ms, >= 0), `network_utilization` (% 0..100), `available_bandwidth` (Mbps, >= 0),
+`cpu_util_avg`/`gpu_util_avg` (% 0..100), free CPU/GPU capacity (>= 0), queue/job counts (integers >= 0),
+`provisioning_delay_s` (seconds, >= 0), `load_index` (0..1), `energy_consumed` (Wh, >= 0), `pue_estimate` (>= 1),
+`carbon_intensity` (gCO2/kWh, >= 0), `energy_per_task_proxy` (>= 0), `update_frequency` (seconds, > 0),
+`data_confidence` and `coverage_ratio` (0..1), and `stale_flag`.
+
+Aliases: timestamp `ts`, IoT `bucket_15m`, OpenStack/IoT `updated_at`; status `state`, `status`; maintenance
+`maintenance`, OpenStack `planned_maintenance`; CPU/GPU utilisation `cpu_utilization`, `cpu_utilisation`,
+`cpu_util`, `cpu_util_percent`, `gpu_utilization`, `gpu_utilisation`, `gpu_util`, `gpu_util_percent`; stability
+`stability`, `stability_index`; staleness `stale`, `is_stale`; network/energy aliases `jitter_ms`,
+`packet_loss_percent`, `available_bandwidth_mbps`, `energy_wh`, `ci_gco2_kwh`, `pue`.
+IoT availability may use explicit ratios or counts: `alive_nodes`/`active_nodes` with `total_nodes`/`node_count`,
+and `active_links` with `total_links`. OpenStack utilisation may be derived from `total_vcpus`/`vcpus_total`
+and `free_vcpus`/`vcpus_free`, or from `total_gpus`/`gpus_total` and `free_gpus`/`gpus_free`.
+
+Validation: invalid types, enum values, ranges, missing timestamp/identity, impossible counts, inconsistent
+maintenance state, and conflicting explicit-vs-derived values return HTTP 422 with field-specific `detail` entries.
+Unknown fields are returned in submission warnings and stored in `extensions`; extensions are not used by training
+or prediction until explicitly mapped.
+"""
+
+
+PROFILE_EXAMPLES = {
+    "generic_profile": {
+        "summary": "Generic static profile",
+        "value": {
+            "site_id": "SLICES-GR-UTH",
+            "ri_type": "grid",
+            "location": "UTH",
+            "compute_capacity": 128,
+            "gpu_capacity": 0,
+            "storage_capacity": 2048,
+            "network_topology": "Mesh",
+            "link_capacities": {"core_mbps": 10000},
+            "supported_workload_types": ["batch", "stream", "ml"],
+            "energy_capabilities": {"metering": True},
+            "static_pue_baseline": 1.2,
+            "local_owner": "UTH",
+        },
+    },
+    "iot_profile_aliases": {
+        "summary": "IoT adapter aliases with independent RI type",
+        "value": {
+            "site": "SLICES-GR-UTH",
+            "ri_type": "network",
+            "facility": "Volos lab",
+            "node_count": 32,
+            "topology": "Mesh",
+            "pue": 1.35,
+            "sensor_generation": "v2",
+        },
+    },
+    "openstack_profile_aliases": {
+        "summary": "OpenStack capacity aliases",
+        "value": {
+            "cloud_name": "OPENSTACK-DEMO",
+            "ri_type": "cloud",
+            "region_name": "eu-west",
+            "total_vcpus": 256,
+            "total_gpus": 8,
+            "total_disk_gb": 50000,
+        },
+    },
+}
+
+
+STATUS_EXAMPLES = {
+    "uth_dynamic_metrics": {
+        "summary": "Canonical UTH status metrics",
+        "value": {
+            "site_id": "SLICES-GR-UTH",
+            "ri_type": "grid",
+            "timestamp": "2026-09-08T07:00:00Z",
+            "operational_status": "DEGRADED",
+            "maintenance_flag": False,
+            "node_availability": 0.95,
+            "link_availability": 0.98,
+            "stability_score": 0.99,
+            "packet_loss": 0.1,
+            "network_jitter": 2.0,
+            "network_utilization": 42.0,
+            "available_bandwidth": 1000.0,
+            "cpu_util_avg": 55.0,
+            "queue_length": 3,
+            "remaining_jobs": 7,
+            "load_index": 0.61,
+            "energy_consumed": 123.4,
+            "pue_estimate": 1.2,
+            "carbon_intensity": 250.0,
+            "update_frequency": 3600,
+            "data_confidence": 0.9,
+            "coverage_ratio": 0.95,
+            "stale_flag": False,
+            "local_note": "retained as extension",
+        },
+    },
+    "iot_counts": {
+        "summary": "IoT counts derive availability ratios",
+        "value": {
+            "site": "SLICES-GR-UTH",
+            "ri_type": "network",
+            "ts": "2026-09-08T07:00:00Z",
+            "alive_nodes": 0,
+            "total_nodes": 32,
+            "active_links": 7,
+            "total_links": 10,
+            "cpu_utilization": 0,
+            "stability": 1.0,
+            "stale": False,
+        },
+    },
+    "openstack_utilisation": {
+        "summary": "OpenStack utilisation derived from free and total capacity",
+        "value": {
+            "cloud_name": "OPENSTACK-DEMO",
+            "ri_type": "cloud",
+            "updated_at": "2026-09-08T07:00:00Z",
+            "total_vcpus": 256,
+            "free_vcpus": 120,
+            "total_gpus": 8,
+            "free_gpus": 2,
+            "pending_vms": 4,
+            "vm_provisioning_delay_s": 180,
+        },
+    },
+}
+
+
+SUBMISSION_VALIDATION_RESPONSE = {
+    "description": "Submission validation failed with field-specific errors",
+    "content": {
+        "application/json": {
+            "example": {
+                "detail": [
+                    {
+                        "loc": ["body", 0, "timestamp"],
+                        "msg": "timestamp is required",
+                        "type": "value_error.missing",
+                    },
+                    {
+                        "loc": ["body", 0, "node_availability"],
+                        "msg": "node_availability must be less than or equal to 1",
+                        "type": "value_error.range",
+                    },
+                ]
+            }
+        }
+    },
+}
 
 
 def get_db() -> Session:
@@ -147,6 +341,18 @@ app = FastAPI(
     ),
     openapi_tags=[
         {
+            "name": "l2-prediction",
+            "description": "EUR-facing L2 prediction endpoint for inferred site availability, resources, and feasibility.",
+        },
+        {
+            "name": "m3l2-ops",
+            "description": "Operational health, ingestion, training, model registry, and cache metrics.",
+        },
+        {
+            "name": "training-data",
+            "description": "Compatibility endpoints for loading training-compatible site profile and status data.",
+        },
+        {
             "name": "Auth",
             "description": (
                 "EIMPS-style login endpoints. Obtain a 24-hour JWT from `/auth/login` or `/auth/token`, "
@@ -186,25 +392,51 @@ def root() -> RedirectResponse:
     return RedirectResponse(url="/auth/login")
 
 
-@app.get("/health")
+@app.get("/health", tags=["m3l2-ops"])
 def health(session: Session = Depends(get_db)) -> dict[str, Any]:
     active = get_active_model(session)
     return {"status": "ok", "db": "ok", "active_model_version": active.version if active else None}
 
 
-@app.post("/ingest/run")
+@app.post("/ingest/run", tags=["m3l2-ops"])
 def ingest_run(request: IngestRunRequest | None = None) -> dict[str, Any]:
     payload = _schema_dump(request) if request else {}
     return run_ingestion(**payload)
 
 
-@app.post("/train")
+@app.post("/train", tags=["m3l2-ops"])
 def train() -> dict[str, Any]:
     return train_model(force=True)
 
 
-@app.post("/predict", response_model=PredictionResponse, responses={503: {"description": "No active model is available"}})
+@app.post(
+    "/predict",
+    response_model=PredictionResponse,
+    include_in_schema=False,
+    responses={503: {"description": "No active model is available"}},
+)
 def predict(request: PredictRequest):
+    return _predict_response(request)
+
+
+@app.post(
+    "/l2/predict",
+    response_model=PredictionResponse,
+    tags=["l2-prediction"],
+    responses={
+        401: {"description": "Bearer token is required"},
+        404: {"description": "Candidate sites could not be resolved"},
+        503: {"description": "No active model is available"},
+    },
+)
+def l2_predict(
+    request: PredictRequest,
+    principal: SitePrincipal = Depends(current_principal),
+):
+    return _predict_response(request)
+
+
+def _predict_response(request: PredictRequest):
     try:
         result = run_predict(request)
     except ValueError as exc:
@@ -216,7 +448,7 @@ def predict(request: PredictRequest):
     return result
 
 
-@app.post("/predict/batch")
+@app.post("/predict/batch", include_in_schema=False)
 def predict_batch(requests: list[PredictRequest]):
     try:
         responses = predict_many(requests)
@@ -233,12 +465,12 @@ def predict_batch(requests: list[PredictRequest]):
     return responses
 
 
-@app.get("/models")
+@app.get("/models", tags=["m3l2-ops"])
 def models(session: Session = Depends(get_db)) -> list[dict[str, Any]]:
     return [serialise_model(row) for row in list_models(session)]
 
 
-@app.get("/models/{version}")
+@app.get("/models/{version}", tags=["m3l2-ops"])
 def model(version: str, session: Session = Depends(get_db)) -> dict[str, Any]:
     row = get_model_by_version(session, version)
     if row is None:
@@ -246,7 +478,7 @@ def model(version: str, session: Session = Depends(get_db)) -> dict[str, Any]:
     return serialise_model(row)
 
 
-@app.get("/metrics")
+@app.get("/metrics", tags=["m3l2-ops"])
 def metrics(session: Session = Depends(get_db)) -> dict[str, Any]:
     active = get_active_model(session)
     latest_ingested_at = session.execute(select(ExecutionRecord.ingested_at).order_by(desc(ExecutionRecord.ingested_at))).scalars().first()
@@ -263,16 +495,39 @@ def metrics(session: Session = Depends(get_db)) -> dict[str, Any]:
     }
 
 
-@app.post("/site-profiles")
+@app.post(
+    "/site-profiles",
+    tags=["training-data"],
+    description=PROFILE_SUBMISSION_DESCRIPTION,
+    responses={422: SUBMISSION_VALIDATION_RESPONSE},
+)
 def upsert_site_profiles(
-    payload: dict[str, Any] | list[dict[str, Any]] = Body(...),
-    adapter_type: str = "generic",
+    payload: dict[str, Any] | list[dict[str, Any]] = Body(..., openapi_examples=PROFILE_EXAMPLES),
+    adapter_type: Literal["generic", "iot", "openstack"] = Query(
+        "generic",
+        description="Selects the input alias adapter. It does not classify `ri_type`.",
+    ),
     session: Session = Depends(get_db),
 ) -> dict[str, Any]:
     items = payload if isinstance(payload, list) else [payload]
+    profiles = []
+    warnings = []
+    errors = []
+    for index, item in enumerate(items):
+        try:
+            profile = normalise_site_profile(item, adapter_type=adapter_type)
+        except SiteAdapterValidationError as exc:
+            errors.extend(_submission_errors(exc.errors, index if isinstance(payload, list) else None))
+            continue
+        warning = _warnings(index, profile)
+        if warning:
+            warnings.append(warning)
+        profiles.append(profile)
+    if errors:
+        raise HTTPException(status_code=422, detail=errors)
+
     upserted = 0
-    for item in items:
-        profile = normalise_site_profile(item, adapter_type=adapter_type)
+    for profile in profiles:
         existing = session.execute(select(SiteProfile).where(SiteProfile.site_id == profile["site_id"])).scalar_one_or_none()
         profile["updated_at"] = utc_now()
         if existing is None:
@@ -282,31 +537,54 @@ def upsert_site_profiles(
                 setattr(existing, key, value)
         upserted += 1
     session.commit()
-    return {"upserted": upserted, "adapter_type": adapter_type}
+    return {"upserted": upserted, "adapter_type": adapter_type, "warnings": warnings}
 
 
-@app.get("/site-profiles")
+@app.get("/site-profiles", tags=["training-data"])
 def list_site_profiles(session: Session = Depends(get_db)) -> list[dict[str, Any]]:
     return [_serialise_row(row) for row in session.execute(select(SiteProfile).order_by(SiteProfile.site_id)).scalars()]
 
 
-@app.post("/site-status")
+@app.post(
+    "/site-status",
+    tags=["training-data"],
+    description=STATUS_SUBMISSION_DESCRIPTION,
+    responses={422: SUBMISSION_VALIDATION_RESPONSE},
+)
 def ingest_site_status(
-    payload: dict[str, Any] | list[dict[str, Any]] = Body(...),
-    adapter_type: str = "generic",
+    payload: dict[str, Any] | list[dict[str, Any]] = Body(..., openapi_examples=STATUS_EXAMPLES),
+    adapter_type: Literal["generic", "iot", "openstack"] = Query(
+        "generic",
+        description="Selects the input alias adapter. It does not classify `ri_type`.",
+    ),
     session: Session = Depends(get_db),
 ) -> dict[str, Any]:
     items = payload if isinstance(payload, list) else [payload]
+    statuses = []
+    warnings = []
+    errors = []
+    for index, item in enumerate(items):
+        try:
+            status = normalise_site_status(item, adapter_type=adapter_type)
+        except SiteAdapterValidationError as exc:
+            errors.extend(_submission_errors(exc.errors, index if isinstance(payload, list) else None))
+            continue
+        warning = _warnings(index, status)
+        if warning:
+            warnings.append(warning)
+        statuses.append(status)
+    if errors:
+        raise HTTPException(status_code=422, detail=errors)
+
     inserted = 0
-    for item in items:
-        status = normalise_site_status(item, adapter_type=adapter_type)
+    for status in statuses:
         session.add(SiteStatusSnapshot(**status, ingested_at=utc_now()))
         inserted += 1
     session.commit()
-    return {"inserted": inserted, "adapter_type": adapter_type}
+    return {"inserted": inserted, "adapter_type": adapter_type, "warnings": warnings}
 
 
-@app.get("/site-status/latest")
+@app.get("/site-status/latest", tags=["training-data"])
 def latest_site_status(site_id: str | None = None, session: Session = Depends(get_db)) -> list[dict[str, Any]]:
     sites = [site_id] if site_id else [
         site for site in session.execute(select(SiteStatusSnapshot.site_id).distinct()).scalars().all() if site
@@ -323,7 +601,7 @@ def latest_site_status(site_id: str | None = None, session: Session = Depends(ge
     return rows
 
 
-@app.delete("/control/execution-records")
+@app.delete("/control/execution-records", tags=["m3l2-ops"])
 def delete_execution_records(
     source: str | None = None,
     site_id: str | None = None,
@@ -356,7 +634,7 @@ def delete_execution_records(
     return {"matched": len(matched), "deleted": 0 if dry_run else len(matched), "dry_run": dry_run}
 
 
-@app.delete("/control/site-status")
+@app.delete("/control/site-status", tags=["m3l2-ops"])
 def delete_site_status(
     source: str | None = None,
     site_id: str | None = None,
