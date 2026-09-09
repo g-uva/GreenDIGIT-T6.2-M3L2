@@ -221,7 +221,7 @@ class SitePrediction(APIModel):
     registered_site_id: str | None = None
     requested_site_id: str | None = None
     site_id_resolution: str | None = None
-    target: str = "energy_wh"
+    target: str = "l2_site_status"
     forecast: list[ForecastPoint]
     energy_forecast: list[ForecastPoint] = Field(default_factory=list)
     site_status_forecast: list[dict[str, Any]] = Field(default_factory=list)
@@ -245,7 +245,7 @@ class PredictionResponse(APIModel):
     valid_until: datetime | str
     model_name: str
     model_version: str
-    target: str = "energy_wh"
+    target: str = "l2_site_status"
     forecast_start_time: datetime | str
     horizon: str
     step: str

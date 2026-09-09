@@ -4,9 +4,10 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from m3l2.app.db import ModelRegistry
+from m3l2.training.train import TARGET
 
 
-def get_active_model(session: Session, target: str = "energy_wh") -> ModelRegistry | None:
+def get_active_model(session: Session, target: str = TARGET) -> ModelRegistry | None:
     return session.execute(
         select(ModelRegistry)
         .where(ModelRegistry.target == target, ModelRegistry.active.is_(True))

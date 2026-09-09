@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from m3l2.app.db import (
+    AuthUser,
     ExecutionRecord,
     ForecastCache,
     ModelRegistry,
@@ -21,12 +22,14 @@ from m3l2.app.db import (
 from m3l2.app.main import app
 from m3l2.app.schemas import PredictRequest
 from m3l2.inference.predict import predict
+from m3l2.site_adapter.auth import create_site_jwt
 from m3l2.training.train import train_model
 
 
 def _seed_records(count: int = 8) -> None:
     base = datetime(2026, 1, 1, tzinfo=timezone.utc)
     with SessionLocal() as session:
+        session.add(AuthUser(email="reader@uth.gr", password_hash="unused", enabled=True))
         for idx in range(count):
             start = base + timedelta(hours=idx)
             site_id = "site-a" if idx % 2 == 0 else "site-b"
@@ -41,6 +44,22 @@ def _seed_records(count: int = 8) -> None:
                     energy_wh=20.0 + idx,
                     work=100.0 + (idx * 10),
                     work_type="cpu_time",
+                )
+            )
+            session.add(
+                SiteStatusSnapshot(
+                    site_id=site_id,
+                    ri_type="cloud",
+                    timestamp=start,
+                    operational_status="UP",
+                    node_availability=1.0,
+                    link_availability=1.0,
+                    free_cpu_capacity=16 + (idx % 3),
+                    free_gpu_capacity=1,
+                    queue_length=idx % 2,
+                    provisioning_delay_s=20 + idx,
+                    load_index=0.2 + (idx * 0.01),
+                    carbon_intensity=250,
                 )
             )
         for site_id in ("site-a", "site-b"):
@@ -131,8 +150,8 @@ def test_changed_training_data_triggers_retraining(temp_database, monkeypatch, t
     _prepare_training(monkeypatch, tmp_path)
     first = train_model(force=True)
     with SessionLocal() as session:
-        row = session.execute(select(ExecutionRecord).where(ExecutionRecord.exec_unit_id == "exec-0")).scalar_one()
-        row.energy_wh = 999.0
+        row = session.execute(select(SiteStatusSnapshot).where(SiteStatusSnapshot.site_id == "site-a")).scalars().first()
+        row.free_cpu_capacity = 999.0
         session.commit()
 
     second = train_model(force=False)
@@ -147,12 +166,15 @@ def test_hgbr_model_trains_and_predicts(temp_database, monkeypatch, tmp_path):
     result = train_model(force=True)
 
     bundle = joblib.load(result["path"])
-    assert bundle["pipeline"].named_steps["model"].__class__.__name__ == "HistGradientBoostingRegressor"
+    assert bundle["feature_schema"]["target"] == "l2_site_status"
+    assert bundle["pipeline"].named_steps["model"].__class__.__name__ == "MultiOutputRegressor"
 
     prediction = predict(_predict_payload())
     assert prediction["status"] == "ok"
     assert prediction["model_name"] == "hist_gradient_boosting_mvp"
-    assert prediction["results"][0]["forecast"][0]["value"] >= 0
+    assert prediction["target"] == "l2_site_status"
+    assert prediction["results"][0]["forecast"][0]["unit"] == "ratio"
+    assert prediction["results"][0]["site_status_forecast"][0]["inference_source"] == "model"
 
 
 def test_workload_specific_cache_isolation(temp_database, monkeypatch, tmp_path):
@@ -235,7 +257,8 @@ def test_successful_typed_predict_request(temp_database, monkeypatch, tmp_path):
     body = response.json()
     assert body["request_id"] == "req-typed"
     assert body["results"][0]["site_id"] == "site-a"
-    assert body["results"][0]["energy_forecast"][0]["unit"] == "Wh"
+    assert body["results"][0]["energy_forecast"] == []
+    assert body["results"][0]["site_status_forecast"][0]["inference_source"] == "model"
 
 
 def test_predict_resolves_registered_site_to_training_site(temp_database, monkeypatch, tmp_path):
@@ -251,7 +274,7 @@ def test_predict_resolves_registered_site_to_training_site(temp_database, monkey
     assert result["training_site_id"] == "site-a"
     assert result["registered_site_id"] == "PUBLIC-SITE-A"
     assert result["site_id_resolution"] == "registered_site_mapping"
-    assert "missing_execution_history" not in result["warnings"]
+    assert result["target"] == "l2_site_status"
 
 
 def test_public_and_training_site_ids_reuse_cache_entry(temp_database, monkeypatch, tmp_path):
@@ -290,6 +313,25 @@ def test_predict_returns_clear_error_for_unknown_site(temp_database, monkeypatch
     body = response.json()
     assert body["status"] == "candidate_sites_not_found"
     assert body["missing_site_ids"] == ["UNKNOWN-SITE"]
+
+
+def test_successful_authenticated_l2_predict_request(temp_database, monkeypatch, tmp_path):
+    _prepare_training(monkeypatch, tmp_path)
+    train_model(force=True)
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
+    token = create_site_jwt("reader@uth.gr", "PUBLIC-SITE-A", "reader", "test-secret")
+    payload = _predict_payload("l2-mapped")
+    payload["candidate_site_ids"] = ["PUBLIC-SITE-A"]
+
+    with TestClient(app) as client:
+        response = client.post("/l2/predict", headers={"Authorization": f"Bearer {token}"}, json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["results"][0]["site_id"] == "PUBLIC-SITE-A"
+    assert body["results"][0]["training_site_id"] == "site-a"
 
 
 def test_invalid_workload_time_and_resource_inputs(temp_database, monkeypatch):

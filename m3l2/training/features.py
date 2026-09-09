@@ -4,9 +4,10 @@ import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from m3l2.app.db import ExecutionRecord
+from m3l2.app.db import ExecutionRecord, SiteSnapshot, SiteStatusSnapshot
+from m3l2.ingestion.site_adapter import normalise_site_status
 
-FEATURE_COLUMNS = [
+ENERGY_FEATURE_COLUMNS = [
     "site_id",
     "ri_type",
     "start_ts",
@@ -20,11 +21,38 @@ FEATURE_COLUMNS = [
     "rolling_work_mean_site_24h",
 ]
 
+STATUS_TARGET_COLUMNS = [
+    "operational_status_score",
+    "maintenance_flag",
+    "node_availability",
+    "link_availability",
+    "free_cpu_capacity",
+    "free_gpu_capacity",
+    "queue_length",
+    "provisioning_delay_s",
+    "load_index",
+]
+
+STATUS_FEATURE_COLUMNS = [
+    "site_id",
+    "ri_type",
+    "timestamp",
+    "hour",
+    "day_of_week",
+    "records_count_site_24h",
+    "rolling_availability_mean_site_24h",
+    "rolling_free_cpu_mean_site_24h",
+    "rolling_queue_mean_site_24h",
+    "rolling_load_mean_site_24h",
+]
+
+FEATURE_COLUMNS = ENERGY_FEATURE_COLUMNS
+
 
 def build_training_frame(session: Session) -> pd.DataFrame:
     rows = session.execute(select(ExecutionRecord)).scalars().all()
     if not rows:
-        return pd.DataFrame(columns=FEATURE_COLUMNS)
+        return pd.DataFrame(columns=ENERGY_FEATURE_COLUMNS)
 
     data = [
         {
@@ -42,7 +70,7 @@ def build_training_frame(session: Session) -> pd.DataFrame:
     df["stop_ts"] = pd.to_datetime(df["stop_ts"], utc=True)
     df = df[df["energy_wh"].notna() & (df["energy_wh"] > 0)].copy()
     if df.empty:
-        return pd.DataFrame(columns=FEATURE_COLUMNS)
+        return pd.DataFrame(columns=ENERGY_FEATURE_COLUMNS)
 
     durations = (df["stop_ts"] - df["start_ts"]).dt.total_seconds()
     valid_durations = durations[durations.notna() & (durations >= 0)]
@@ -62,5 +90,121 @@ def build_training_frame(session: Session) -> pd.DataFrame:
         rolling_frames.append(group.reset_index())
 
     df = pd.concat(rolling_frames, ignore_index=True).sort_values("start_ts")
-    return df[FEATURE_COLUMNS].reset_index(drop=True)
+    return df[ENERGY_FEATURE_COLUMNS].reset_index(drop=True)
 
+
+def _status_score(value: str | None) -> float:
+    return {
+        "DOWN": 0.0,
+        "MAINTENANCE": 0.0,
+        "DEGRADED": 0.5,
+        "UP": 1.0,
+        "AVAILABLE": 1.0,
+        "OK": 1.0,
+    }.get(str(value or "UP").upper(), 0.5)
+
+
+def _status_training_row(row: SiteStatusSnapshot) -> dict:
+    return {
+        "site_id": row.site_id or "unknown-site",
+        "ri_type": row.ri_type or "unknown",
+        "timestamp": row.timestamp,
+        "operational_status_score": _status_score(row.operational_status),
+        "maintenance_flag": 1.0 if row.maintenance_flag else 0.0,
+        "node_availability": row.node_availability,
+        "link_availability": row.link_availability,
+        "free_cpu_capacity": row.free_cpu_capacity,
+        "free_gpu_capacity": row.free_gpu_capacity,
+        "queue_length": row.queue_length,
+        "provisioning_delay_s": row.provisioning_delay_s,
+        "load_index": row.load_index,
+        "cpu_util_avg": row.cpu_util_avg,
+    }
+
+
+def _snapshot_status_payload(snapshot: SiteSnapshot) -> dict:
+    return {
+        "site_id": snapshot.site_id,
+        "timestamp": snapshot.ts,
+        **(snapshot.availability or {}),
+        **(snapshot.usage or {}),
+        **(snapshot.efficiency or {}),
+        **(snapshot.status or {}),
+        **(snapshot.quality or {}),
+    }
+
+
+def _snapshot_training_row(snapshot: SiteSnapshot) -> dict | None:
+    try:
+        status = normalise_site_status(_snapshot_status_payload(snapshot))
+    except ValueError:
+        return None
+    return {
+        "site_id": status["site_id"] or "unknown-site",
+        "ri_type": status.get("ri_type") or "unknown",
+        "timestamp": status["timestamp"],
+        "operational_status_score": _status_score(status.get("operational_status")),
+        "maintenance_flag": 1.0 if status.get("maintenance_flag") else 0.0,
+        "node_availability": status.get("node_availability"),
+        "link_availability": status.get("link_availability"),
+        "free_cpu_capacity": status.get("free_cpu_capacity"),
+        "free_gpu_capacity": status.get("free_gpu_capacity"),
+        "queue_length": status.get("queue_length"),
+        "provisioning_delay_s": status.get("provisioning_delay_s"),
+        "load_index": status.get("load_index"),
+        "cpu_util_avg": status.get("cpu_util_avg"),
+    }
+
+
+def build_site_status_training_frame(session: Session) -> pd.DataFrame:
+    rows = session.execute(select(SiteStatusSnapshot)).scalars().all()
+    snapshots = session.execute(select(SiteSnapshot)).scalars().all()
+    if not rows and not snapshots:
+        return pd.DataFrame(columns=STATUS_FEATURE_COLUMNS + STATUS_TARGET_COLUMNS)
+
+    data = [_status_training_row(row) for row in rows]
+    existing_keys = {(item["site_id"], item["timestamp"]) for item in data}
+    for snapshot in snapshots:
+        if (snapshot.site_id, snapshot.ts) in existing_keys:
+            continue
+        item = _snapshot_training_row(snapshot)
+        if item is not None:
+            data.append(item)
+    df = pd.DataFrame(data)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df = df[df["timestamp"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame(columns=STATUS_FEATURE_COLUMNS + STATUS_TARGET_COLUMNS)
+
+    df["node_availability"] = pd.to_numeric(df["node_availability"], errors="coerce")
+    df["link_availability"] = pd.to_numeric(df["link_availability"], errors="coerce")
+    df["free_cpu_capacity"] = pd.to_numeric(df["free_cpu_capacity"], errors="coerce")
+    df["free_gpu_capacity"] = pd.to_numeric(df["free_gpu_capacity"], errors="coerce")
+    df["queue_length"] = pd.to_numeric(df["queue_length"], errors="coerce")
+    df["provisioning_delay_s"] = pd.to_numeric(df["provisioning_delay_s"], errors="coerce")
+    df["load_index"] = pd.to_numeric(df["load_index"], errors="coerce")
+    df["cpu_util_avg"] = pd.to_numeric(df["cpu_util_avg"], errors="coerce")
+    df["node_availability"] = df["node_availability"].fillna(1.0).clip(lower=0.0, upper=1.0)
+    df["link_availability"] = df["link_availability"].fillna(df["node_availability"]).clip(lower=0.0, upper=1.0)
+    df["free_cpu_capacity"] = df["free_cpu_capacity"].fillna(0.0).clip(lower=0.0)
+    df["free_gpu_capacity"] = df["free_gpu_capacity"].fillna(0.0).clip(lower=0.0)
+    df["queue_length"] = df["queue_length"].fillna(0.0).clip(lower=0.0)
+    df["provisioning_delay_s"] = df["provisioning_delay_s"].fillna(0.0).clip(lower=0.0)
+    inferred_load = (df["cpu_util_avg"].fillna(0.0) / 100.0) + (df["queue_length"] / 50.0)
+    df["load_index"] = df["load_index"].fillna(inferred_load).fillna(0.0).clip(lower=0.0, upper=1.0)
+    df["hour"] = df["timestamp"].dt.hour
+    df["day_of_week"] = df["timestamp"].dt.dayofweek
+    df.sort_values(["site_id", "timestamp"], inplace=True)
+
+    rolling_frames = []
+    for _, group in df.groupby("site_id", sort=False):
+        group = group.sort_values("timestamp").set_index("timestamp")
+        group["records_count_site_24h"] = group["node_availability"].rolling("24h", min_periods=1).count().to_numpy()
+        group["rolling_availability_mean_site_24h"] = group["node_availability"].rolling("24h", min_periods=1).mean().to_numpy()
+        group["rolling_free_cpu_mean_site_24h"] = group["free_cpu_capacity"].rolling("24h", min_periods=1).mean().to_numpy()
+        group["rolling_queue_mean_site_24h"] = group["queue_length"].rolling("24h", min_periods=1).mean().to_numpy()
+        group["rolling_load_mean_site_24h"] = group["load_index"].rolling("24h", min_periods=1).mean().to_numpy()
+        rolling_frames.append(group.reset_index())
+
+    df = pd.concat(rolling_frames, ignore_index=True).sort_values("timestamp")
+    return df[STATUS_FEATURE_COLUMNS + STATUS_TARGET_COLUMNS].reset_index(drop=True)

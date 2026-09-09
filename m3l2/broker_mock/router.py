@@ -56,24 +56,38 @@ def _first_forecast_value(prediction: dict[str, Any]) -> float | None:
 
 
 def _latest_availability_status(prediction: dict[str, Any]) -> str:
+    status_forecast = prediction.get("site_status_forecast") or []
+    if status_forecast and isinstance(status_forecast[0], dict):
+        status = status_forecast[0].get("operational_status") or ""
+        return str(status).lower()
     latest = prediction.get("latest_site_status") or {}
     availability = latest.get("availability") or {}
     status = availability.get("status") or availability.get("operational_status") or ""
     return str(status).lower()
 
 
+def _free_cpu_capacity(prediction: dict[str, Any]) -> float:
+    capacity = prediction.get("capacity") or {}
+    value = capacity.get("free_cpu_capacity")
+    return float(value) if value is not None else 0.0
+
+
 def _select_best_site(predictions: list[dict[str, Any]]) -> tuple[str, dict[str, Any], float]:
-    candidates: list[tuple[str, dict[str, Any], float]] = []
+    candidates: list[tuple[str, dict[str, Any], float, float]] = []
     for prediction in predictions:
+        feasibility = prediction.get("feasibility") or {}
+        if feasibility.get("status") == "infeasible":
+            continue
         if _latest_availability_status(prediction) in {"down", "maintenance"}:
             continue
         value = _first_forecast_value(prediction)
         if value is None:
             continue
-        candidates.append((prediction["site_id"], prediction, value))
+        candidates.append((prediction["site_id"], prediction, value, _free_cpu_capacity(prediction)))
     if not candidates:
         raise HTTPException(status_code=409, detail="No candidate site is available for submission")
-    return min(candidates, key=lambda item: item[2])
+    site_id, prediction, availability, _ = max(candidates, key=lambda item: (item[2], item[3]))
+    return site_id, prediction, availability
 
 
 @router.post("/submit")
@@ -111,9 +125,9 @@ async def submit_to_best_site(payload: MockBrokerSubmitRequest, session: Session
     submission_response = await forward_workload_to_site(session, site_id, workload_payload)
     return {
         "selected_site": site_id,
-        "reason": "lowest_predicted_energy_wh",
+        "reason": "highest_predicted_l2_availability",
         "prediction_summary": {
-            "first_forecast_energy_wh": first_value,
+            "first_forecast_availability": first_value,
             "selected_prediction": prediction,
         },
         "submission_response": submission_response,

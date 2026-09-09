@@ -3,10 +3,10 @@ from pydantic import BaseModel, Field
 from typing import List, Dict, Any
 import json, joblib, pathlib, torch
 """
-To test a curl request:
+To test a local curl request against the legacy compatibility endpoint:
 uvicorn predict_xgb_lstm:app --host 0.0.0.0 --port 8000
 
-curl -X POST http://localhost:3000/predict \
+curl -X POST http://localhost:3000/<compatibility-prediction-route> \
   -H 'Content-Type: application/json' \
   -d '{
         "features": {
@@ -78,7 +78,7 @@ def model_info():
     meta = json.loads((ROOT/"models"/"champion.json").read_text())
     return meta
 
-@app.post("/predict")
+@app.post("/predict", include_in_schema=False)
 def predict(payload: Dict[str, Any]):
     if MODEL_TYPE in ("xgboost","sklearn"):
         if "features" not in payload:

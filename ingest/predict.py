@@ -24,7 +24,7 @@ app = FastAPI()
 #     y_hat = model.predict(df)[0]
 #     return {"power_forecast": float(y_hat)}
 
-@app.post("/predict")
+@app.post("/predict", include_in_schema=False)
 def predict(payload: dict):
     """
     If champion is tree/GBM: send a feature dict as before.

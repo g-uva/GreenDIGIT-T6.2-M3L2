@@ -26,7 +26,7 @@ from m3l2.app.db import (
 from m3l2.app.schemas import PredictRequest
 from m3l2.inference.cache import cache_state, get_valid_cache, store_cache
 from m3l2.training.registry import get_active_model
-from m3l2.training.train import FEATURE_COLUMNS, TARGET
+from m3l2.training.train import FEATURE_COLUMNS, TARGET, TARGET_COLUMNS
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +244,82 @@ def _base_feature_row(site_id: str, context: ExecutionRecord | None, ts: datetim
     }
 
 
+def _base_l2_feature_row(site_id: str, status: SiteStatusSnapshot | None, profile: SiteProfile | None, ts: datetime) -> dict[str, Any]:
+    availability = status.node_availability if status and status.node_availability is not None else 1.0
+    free_cpu = status.free_cpu_capacity if status and status.free_cpu_capacity is not None else (profile.compute_capacity if profile else 0.0)
+    queue_length = status.queue_length if status and status.queue_length is not None else 0
+    load_index = status.load_index if status and status.load_index is not None else 0.0
+    return {
+        "site_id": site_id,
+        "ri_type": (status.ri_type if status else None) or (profile.ri_type if profile else "unknown"),
+        "timestamp": ts,
+        "hour": ts.hour,
+        "day_of_week": ts.weekday(),
+        "records_count_site_24h": 1.0 if status else 0.0,
+        "rolling_availability_mean_site_24h": float(availability),
+        "rolling_free_cpu_mean_site_24h": float(free_cpu or 0.0),
+        "rolling_queue_mean_site_24h": float(queue_length or 0),
+        "rolling_load_mean_site_24h": float(load_index or 0.0),
+    }
+
+
+def _clip(value: Any, lower: float | None = None, upper: float | None = None) -> float | None:
+    if value is None:
+        return None
+    parsed = float(value)
+    if lower is not None:
+        parsed = max(parsed, lower)
+    if upper is not None:
+        parsed = min(parsed, upper)
+    return parsed
+
+
+def _predicted_operational_status(score: float | None, maintenance_flag: bool, availability: float | None) -> str:
+    if maintenance_flag:
+        return "MAINTENANCE"
+    score = 1.0 if score is None else score
+    if score < 0.25 or (availability is not None and availability < 0.25):
+        return "DOWN"
+    if score < 0.75 or (availability is not None and availability < 0.95):
+        return "DEGRADED"
+    return "UP"
+
+
+def _status_prediction_row(
+    ts: datetime,
+    values: Any,
+    status: SiteStatusSnapshot | None,
+    profile: SiteProfile | None,
+) -> dict[str, Any]:
+    raw = {target: values[index] for index, target in enumerate(TARGET_COLUMNS)}
+    maintenance_flag = bool((_clip(raw.get("maintenance_flag"), 0.0, 1.0) or 0.0) >= 0.5)
+    availability = _clip(raw.get("node_availability"), 0.0, 1.0)
+    free_cpu = _clip(raw.get("free_cpu_capacity"), 0.0, None)
+    free_gpu = _clip(raw.get("free_gpu_capacity"), 0.0, None)
+    queue_length = int(round(_clip(raw.get("queue_length"), 0.0, None) or 0.0))
+    provisioning_delay = _clip(raw.get("provisioning_delay_s"), 0.0, None)
+    load_index = _clip(raw.get("load_index"), 0.0, 1.0)
+    return {
+        "ts": ts.isoformat(),
+        "operational_status": _predicted_operational_status(
+            _clip(raw.get("operational_status_score"), 0.0, 1.0),
+            maintenance_flag,
+            availability,
+        ),
+        "availability": availability,
+        "node_availability": availability,
+        "link_availability": _clip(raw.get("link_availability"), 0.0, 1.0),
+        "free_cpu_capacity": free_cpu if free_cpu is not None else (profile.compute_capacity if profile else None),
+        "free_gpu_capacity": free_gpu if free_gpu is not None else (profile.gpu_capacity if profile else None),
+        "queue_length": queue_length,
+        "provisioning_delay_s": provisioning_delay,
+        "maintenance_flag": maintenance_flag,
+        "scheduled_maintenance": status.scheduled_maintenance if status else None,
+        "load_index": load_index,
+        "inference_source": "model",
+    }
+
+
 def _capacity(status: SiteStatusSnapshot | None, profile: SiteProfile | None) -> dict[str, Any]:
     return {
         "compute_capacity": profile.compute_capacity if profile else None,
@@ -253,6 +329,23 @@ def _capacity(status: SiteStatusSnapshot | None, profile: SiteProfile | None) ->
         "free_gpu_capacity": status.free_gpu_capacity if status else None,
         "queue_length": status.queue_length if status else None,
         "provisioning_delay_s": status.provisioning_delay_s if status else None,
+    }
+
+
+def _capacity_from_status_forecast(
+    status_forecast: list[dict[str, Any]],
+    status: SiteStatusSnapshot | None,
+    profile: SiteProfile | None,
+) -> dict[str, Any]:
+    first = status_forecast[0] if status_forecast else {}
+    return {
+        "compute_capacity": profile.compute_capacity if profile else None,
+        "gpu_capacity": profile.gpu_capacity if profile else None,
+        "storage_capacity": profile.storage_capacity if profile else None,
+        "free_cpu_capacity": first.get("free_cpu_capacity", status.free_cpu_capacity if status else None),
+        "free_gpu_capacity": first.get("free_gpu_capacity", status.free_gpu_capacity if status else None),
+        "queue_length": first.get("queue_length", status.queue_length if status else None),
+        "provisioning_delay_s": first.get("provisioning_delay_s", status.provisioning_delay_s if status else None),
     }
 
 
@@ -363,6 +456,43 @@ def _feasibility(status: SiteStatusSnapshot | None, profile: SiteProfile | None,
     return {"status": "infeasible" if reasons else "feasible", "reasons": reasons}
 
 
+def _feasibility_from_status_forecast(
+    status_forecast: list[dict[str, Any]],
+    profile: SiteProfile | None,
+    workload: dict[str, Any],
+) -> dict[str, Any]:
+    if not status_forecast:
+        return {"status": "unknown", "reasons": ["missing_site_status_forecast"]}
+    first = status_forecast[0]
+    reasons: list[str] = []
+    if first.get("maintenance_flag"):
+        reasons.append("predicted_maintenance_flag")
+    operational_status = str(first.get("operational_status") or "").upper()
+    if operational_status not in {"UP", "AVAILABLE", "OK"}:
+        reasons.append(f"predicted_operational_status_{operational_status or 'UNKNOWN'}")
+
+    resources = workload.get("resource_requirements") or {}
+    instances = float(resources.get("instances") or 1)
+    requested_cpu = resources.get("cpu")
+    requested_gpu = resources.get("gpu")
+    requested_storage = resources.get("storage_gb")
+    free_cpu = first.get("free_cpu_capacity")
+    free_gpu = first.get("free_gpu_capacity")
+    if requested_cpu is not None and free_cpu is not None:
+        if float(requested_cpu) * instances > float(free_cpu):
+            reasons.append("predicted_insufficient_free_cpu_capacity")
+    if requested_gpu is not None and free_gpu is not None:
+        if float(requested_gpu) * instances > float(free_gpu):
+            reasons.append("predicted_insufficient_free_gpu_capacity")
+    if requested_storage is not None and profile and profile.storage_capacity is not None:
+        if float(requested_storage) * instances > float(profile.storage_capacity):
+            reasons.append("insufficient_storage_capacity")
+
+    if not workload and not reasons:
+        return {"status": "unknown", "reasons": ["no_workload_requirements"]}
+    return {"status": "infeasible" if reasons else "feasible", "reasons": reasons}
+
+
 def _site_context_signature(session: Session, site_ids: list[str]) -> dict[str, Any]:
     context: dict[str, Any] = {}
     for site_id in sorted(site_ids):
@@ -433,16 +563,21 @@ def _result_from_forecast(
     profile = _site_profile(session, training_site_id)
     workload = _workload_dict(request)
     warnings: list[str] = []
-    if context is None:
-        warnings.append("missing_execution_history")
     freshness = _status_freshness(status, generated_at, _parse_duration(request.step))
     if freshness["site_status_stale"]:
         warnings.append("stale_or_missing_site_status")
 
-    forecast = [{**point, "unit": point.get("unit", "Wh")} for point in forecast_rows]
-    predicted_total = float(sum(point["value"] for point in forecast))
-    quality = _quality(cache_status, 1.0 if context else 0.0, model_metrics)
-    estimates = _efficiency(context, status, workload, predicted_total)
+    status_forecast = forecast_rows
+    forecast = [
+        {
+            "ts": point["ts"],
+            "value": float(point["availability"]) if point.get("availability") is not None else 0.0,
+            "unit": "ratio",
+        }
+        for point in status_forecast
+    ]
+    quality = _quality(cache_status, 1.0 if status else 0.0, model_metrics)
+    estimates: dict[str, Any] = {}
     cache_info = {
         "status": cache_status,
         "request_signature": signature,
@@ -456,11 +591,11 @@ def _result_from_forecast(
         "site_id_resolution": site.get("site_id_resolution"),
         "target": TARGET,
         "forecast": forecast,
-        "energy_forecast": forecast,
-        "site_status_forecast": _status_forecast(status, profile, timestamps),
+        "energy_forecast": [],
+        "site_status_forecast": status_forecast,
         "latest_site_status": _latest_l2_status_metadata(session, site_id) if site_id else None,
-        "capacity": _capacity(status, profile),
-        "feasibility": _feasibility(status, profile, workload),
+        "capacity": _capacity_from_status_forecast(status_forecast, status, profile),
+        "feasibility": _feasibility_from_status_forecast(status_forecast, profile, workload),
         "workload_estimates": estimates,
         "efficiency": estimates,
         "quality": quality,
@@ -514,7 +649,7 @@ def _predict_with_session(request: PredictRequest | dict[str, Any], session: Ses
 
     model_row = get_active_model(session, TARGET)
     if model_row is None:
-        return {"status": "no_active_model", "detail": "No active energy_wh model is registered."}
+        return {"status": "no_active_model", "detail": "No active l2_site_status model is registered."}
 
     generated_at = utc_now()
     forecast_start = _ensure_utc(request.forecast_start_time) if request.forecast_start_time else _floor_to_step(generated_at, step_delta)
@@ -585,28 +720,28 @@ def _predict_with_session(request: PredictRequest | dict[str, Any], session: Ses
             warnings.append("cached_forecast_absent_refreshed")
 
     pipeline = _load_pipeline(model_row)
-    contexts = {site["training_site_id"]: _latest_context(session, site["training_site_id"]) for site in sites}
+    statuses = {site["training_site_id"]: _latest_site_status(session, site["training_site_id"]) for site in sites}
+    profiles = {site["training_site_id"]: _site_profile(session, site["training_site_id"]) for site in sites}
     feature_rows: list[dict[str, Any]] = []
     row_keys: list[tuple[str, datetime]] = []
-    workload = _workload_dict(request)
     for site in sites:
         site_id = site["training_site_id"]
         for ts in timestamps:
             row_keys.append((site_id, ts))
-            feature_rows.append(_base_feature_row(site_id, contexts[site_id], ts, workload))
+            feature_rows.append(_base_l2_feature_row(site_id, statuses[site_id], profiles[site_id], ts))
 
     predicted_by_site: dict[str, list[dict[str, Any]]] = {site["training_site_id"]: [] for site in sites}
     if feature_rows:
         frame = pd.DataFrame(feature_rows, columns=FEATURE_COLUMNS)
         values = pipeline.predict(frame)
         for (site_id, ts), value in zip(row_keys, values):
-            predicted_by_site[site_id].append({"ts": ts.isoformat(), "value": max(float(value), 0.0), "unit": "Wh"})
+            predicted_by_site[site_id].append(_status_prediction_row(ts, value, statuses[site_id], profiles[site_id]))
 
     results = []
     for site in sites:
         site_id = site["training_site_id"]
         forecast_rows = predicted_by_site[site_id]
-        quality = _quality("fresh", 1.0 if contexts[site_id] else 0.0, model_row.metrics)
+        quality = _quality("fresh", 1.0 if statuses[site_id] else 0.0, model_row.metrics)
         store_cache(
             session,
             site_id,
