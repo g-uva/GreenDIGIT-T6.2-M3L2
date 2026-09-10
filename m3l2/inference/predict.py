@@ -274,6 +274,48 @@ def _clip(value: Any, lower: float | None = None, upper: float | None = None) ->
     return parsed
 
 
+def _payload_number(payload: dict[str, Any] | None, names: tuple[str, ...]) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    for name in names:
+        value = payload.get(name)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _submitted_capacity(snapshot: SiteSnapshot | None) -> dict[str, float | None]:
+    if snapshot is None:
+        return {}
+    payload = snapshot.raw_json or {}
+    capabilities = snapshot.capabilities or payload.get("capabilities")
+    return {
+        "compute_capacity": _first_known(
+            _payload_number(capabilities, ("compute_capacity", "total_vcpus", "vcpus_total", "cpu_capacity")),
+            _payload_number(payload, ("compute_capacity", "total_vcpus", "vcpus_total", "cpu_capacity")),
+        ),
+        "gpu_capacity": _first_known(
+            _payload_number(capabilities, ("gpu_capacity", "total_gpus", "gpus_total")),
+            _payload_number(payload, ("gpu_capacity", "total_gpus", "gpus_total")),
+        ),
+        "storage_capacity": _first_known(
+            _payload_number(capabilities, ("storage_capacity", "storage_gb", "total_disk_gb", "disk_gb_total")),
+            _payload_number(payload, ("storage_capacity", "storage_gb", "total_disk_gb", "disk_gb_total")),
+        ),
+    }
+
+
+def _first_known(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
 def _predicted_operational_status(score: float | None, maintenance_flag: bool, availability: float | None) -> str:
     if maintenance_flag:
         return "MAINTENANCE"
@@ -290,10 +332,12 @@ def _status_prediction_row(
     values: Any,
     status: SiteStatusSnapshot | None,
     profile: SiteProfile | None,
+    submitted_capacity: dict[str, float | None] | None = None,
     target_columns: list[str] | None = None,
 ) -> dict[str, Any]:
     targets = target_columns or TARGET_COLUMNS
     raw = dict(zip(targets, values))
+    submitted_capacity = submitted_capacity or {}
     maintenance_flag = bool((_clip(raw.get("maintenance_flag"), 0.0, 1.0) or 0.0) >= 0.5)
     availability = _clip(raw.get("node_availability"), 0.0, 1.0)
     compute_capacity = _clip(raw.get("compute_capacity"), 0.0, None)
@@ -314,9 +358,21 @@ def _status_prediction_row(
         "availability": availability,
         "node_availability": availability,
         "link_availability": _clip(raw.get("link_availability"), 0.0, 1.0),
-        "compute_capacity": compute_capacity if compute_capacity is not None else (profile.compute_capacity if profile else None),
-        "gpu_capacity": gpu_capacity if gpu_capacity is not None else (profile.gpu_capacity if profile else None),
-        "storage_capacity": storage_capacity if storage_capacity is not None else (profile.storage_capacity if profile else None),
+        "compute_capacity": _first_known(
+            compute_capacity,
+            profile.compute_capacity if profile else None,
+            submitted_capacity.get("compute_capacity"),
+        ),
+        "gpu_capacity": _first_known(
+            gpu_capacity,
+            profile.gpu_capacity if profile else None,
+            submitted_capacity.get("gpu_capacity"),
+        ),
+        "storage_capacity": _first_known(
+            storage_capacity,
+            profile.storage_capacity if profile else None,
+            submitted_capacity.get("storage_capacity"),
+        ),
         "free_cpu_capacity": free_cpu if free_cpu is not None else (profile.compute_capacity if profile else None),
         "free_gpu_capacity": free_gpu if free_gpu is not None else (profile.gpu_capacity if profile else None),
         "queue_length": queue_length,
@@ -344,17 +400,61 @@ def _capacity_from_status_forecast(
     status_forecast: list[dict[str, Any]],
     status: SiteStatusSnapshot | None,
     profile: SiteProfile | None,
+    submitted_capacity: dict[str, float | None] | None = None,
 ) -> dict[str, Any]:
     first = status_forecast[0] if status_forecast else {}
+    submitted_capacity = submitted_capacity or {}
     return {
-        "compute_capacity": first.get("compute_capacity", profile.compute_capacity if profile else None),
-        "gpu_capacity": first.get("gpu_capacity", profile.gpu_capacity if profile else None),
-        "storage_capacity": first.get("storage_capacity", profile.storage_capacity if profile else None),
-        "free_cpu_capacity": first.get("free_cpu_capacity", status.free_cpu_capacity if status else None),
-        "free_gpu_capacity": first.get("free_gpu_capacity", status.free_gpu_capacity if status else None),
-        "queue_length": first.get("queue_length", status.queue_length if status else None),
-        "provisioning_delay_s": first.get("provisioning_delay_s", status.provisioning_delay_s if status else None),
+        "compute_capacity": _first_known(
+            first.get("compute_capacity"),
+            profile.compute_capacity if profile else None,
+            submitted_capacity.get("compute_capacity"),
+        ),
+        "gpu_capacity": _first_known(
+            first.get("gpu_capacity"),
+            profile.gpu_capacity if profile else None,
+            submitted_capacity.get("gpu_capacity"),
+        ),
+        "storage_capacity": _first_known(
+            first.get("storage_capacity"),
+            profile.storage_capacity if profile else None,
+            submitted_capacity.get("storage_capacity"),
+        ),
+        "free_cpu_capacity": _first_known(first.get("free_cpu_capacity"), status.free_cpu_capacity if status else None),
+        "free_gpu_capacity": _first_known(first.get("free_gpu_capacity"), status.free_gpu_capacity if status else None),
+        "queue_length": _first_known(first.get("queue_length"), status.queue_length if status else None),
+        "provisioning_delay_s": _first_known(
+            first.get("provisioning_delay_s"),
+            status.provisioning_delay_s if status else None,
+        ),
     }
+
+
+def _fill_forecast_capacity(
+    status_forecast: list[dict[str, Any]],
+    profile: SiteProfile | None,
+    submitted_capacity: dict[str, float | None],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in status_forecast:
+        enriched = dict(row)
+        enriched["compute_capacity"] = _first_known(
+            enriched.get("compute_capacity"),
+            profile.compute_capacity if profile else None,
+            submitted_capacity.get("compute_capacity"),
+        )
+        enriched["gpu_capacity"] = _first_known(
+            enriched.get("gpu_capacity"),
+            profile.gpu_capacity if profile else None,
+            submitted_capacity.get("gpu_capacity"),
+        )
+        enriched["storage_capacity"] = _first_known(
+            enriched.get("storage_capacity"),
+            profile.storage_capacity if profile else None,
+            submitted_capacity.get("storage_capacity"),
+        )
+        rows.append(enriched)
+    return rows
 
 
 def _efficiency(
@@ -576,13 +676,14 @@ def _result_from_forecast(
     context = _latest_context(session, training_site_id)
     status = _latest_site_status(session, training_site_id)
     profile = _site_profile(session, training_site_id)
+    submitted_capacity = _submitted_capacity(_latest_l2_site_snapshot(session, training_site_id))
     workload = _workload_dict(request)
     warnings: list[str] = []
     freshness = _status_freshness(status, generated_at, _parse_duration(request.step))
     if freshness["site_status_stale"]:
         warnings.append("stale_or_missing_site_status")
 
-    status_forecast = forecast_rows
+    status_forecast = _fill_forecast_capacity(forecast_rows, profile, submitted_capacity)
     forecast = [
         {
             "ts": point["ts"],
@@ -609,7 +710,7 @@ def _result_from_forecast(
         "energy_forecast": [],
         "site_status_forecast": status_forecast,
         "latest_site_status": _latest_l2_status_metadata(session, site_id) if site_id else None,
-        "capacity": _capacity_from_status_forecast(status_forecast, status, profile),
+        "capacity": _capacity_from_status_forecast(status_forecast, status, profile, submitted_capacity),
         "feasibility": _feasibility_from_status_forecast(status_forecast, profile, workload),
         "workload_estimates": estimates,
         "efficiency": estimates,
@@ -738,6 +839,10 @@ def _predict_with_session(request: PredictRequest | dict[str, Any], session: Ses
     target_columns = (model_row.feature_schema or {}).get("targets") or TARGET_COLUMNS
     statuses = {site["training_site_id"]: _latest_site_status(session, site["training_site_id"]) for site in sites}
     profiles = {site["training_site_id"]: _site_profile(session, site["training_site_id"]) for site in sites}
+    submitted_capacities = {
+        site["training_site_id"]: _submitted_capacity(_latest_l2_site_snapshot(session, site["training_site_id"]))
+        for site in sites
+    }
     feature_rows: list[dict[str, Any]] = []
     row_keys: list[tuple[str, datetime]] = []
     for site in sites:
@@ -752,7 +857,14 @@ def _predict_with_session(request: PredictRequest | dict[str, Any], session: Ses
         values = pipeline.predict(frame)
         for (site_id, ts), value in zip(row_keys, values):
             predicted_by_site[site_id].append(
-                _status_prediction_row(ts, value, statuses[site_id], profiles[site_id], target_columns)
+                _status_prediction_row(
+                    ts,
+                    value,
+                    statuses[site_id],
+                    profiles[site_id],
+                    submitted_capacities[site_id],
+                    target_columns,
+                )
             )
 
     results = []
