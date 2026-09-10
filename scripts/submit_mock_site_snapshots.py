@@ -36,6 +36,7 @@ def snapshot(site_id: str, ts: datetime, index: int, step_minutes: int) -> dict:
     link_availability = 0.8 if degraded else 1.0
     queue_length = 2 if degraded else max(0, int((cpu_util - 70.0) / 10.0))
     load_index = min(1.0, cpu_util / 100.0 + queue_length / 50.0)
+    free_cpu_capacity = max(0.0, 64.0 * (1.0 - cpu_util / 100.0) - queue_length)
     available_bandwidth = max(0.0, 1000.0 * (1.0 - daily * 0.75))
     energy_consumed = 64.0 * cpu_util / 100.0 * 1.2 * 12.5
     timestamp = ts.isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -61,6 +62,7 @@ def snapshot(site_id: str, ts: datetime, index: int, step_minutes: int) -> dict:
         "usage": {
             "mock": True,
             "cpu_util_avg": round(cpu_util, 4),
+            "free_cpu_capacity": round(free_cpu_capacity, 4),
             "queue_length": queue_length,
             "remaining_jobs": queue_length,
             "load_index": round(load_index, 4),

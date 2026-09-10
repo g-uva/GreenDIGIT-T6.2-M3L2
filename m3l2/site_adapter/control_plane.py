@@ -9,9 +9,10 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from m3l2.app.db import RegisteredSite, SessionLocal, SiteSnapshot, SiteStatusSnapshot, utc_now
-from m3l2.ingestion.site_adapter import normalise_site_status
+from m3l2.ingestion.site_adapter import SiteAdapterValidationError, normalise_site_status
 from m3l2.site_adapter.auth import SitePrincipal, current_principal, require_roles, require_same_site
 from m3l2.site_adapter.schemas import SiteSnapshotIn
+from m3l2.training.features import STATUS_REQUIRED_INPUTS
 
 router = APIRouter(prefix="/l2/sites", tags=["l2-site-adapter"], dependencies=[Depends(current_principal)])
 
@@ -143,6 +144,27 @@ def store_snapshot(
     raw_json: dict[str, Any] | None = None,
     submitted_by_email: str | None = None,
 ) -> SiteSnapshot:
+    try:
+        status = normalise_site_status(_snapshot_status_payload(site_id, payload, ts))
+    except SiteAdapterValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=[{**error, "loc": ["body", *list(error.get("loc", []))]} for error in exc.errors],
+        ) from exc
+    missing = [field for field in STATUS_REQUIRED_INPUTS if status.get(field) is None]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=[
+                {
+                    "loc": ["body", field],
+                    "msg": f"{field} is required for training-compatible snapshots",
+                    "type": "value_error.missing",
+                }
+                for field in missing
+            ],
+        )
+
     snapshot = SiteSnapshot(
         site_id=site_id,
         ts=_to_utc(ts),
@@ -157,14 +179,9 @@ def store_snapshot(
         raw_json=jsonable_encoder(raw_json if raw_json is not None else payload),
     )
     session.add(snapshot)
-    try:
-        status = normalise_site_status(_snapshot_status_payload(site_id, payload, ts))
-    except ValueError:
-        status = None
-    if status is not None:
-        status.pop("_warnings", None)
-        status["raw_json"] = jsonable_encoder({"source_schema": "l2_site_snapshot", **(raw_json if raw_json is not None else payload)})
-        session.add(SiteStatusSnapshot(**status, ingested_at=utc_now()))
+    status.pop("_warnings", None)
+    status["raw_json"] = jsonable_encoder({"source_schema": "l2_site_snapshot", **(raw_json if raw_json is not None else payload)})
+    session.add(SiteStatusSnapshot(**status, ingested_at=utc_now()))
     site = session.execute(select(RegisteredSite).where(RegisteredSite.site_id == site_id)).scalar_one_or_none()
     if site:
         site.last_seen_at = utc_now()

@@ -90,7 +90,8 @@ def test_l2_site_adapter_endpoints_require_bearer_token(temp_database, monkeypat
 
     snapshot_payload = {
         "ts": "2026-09-07T00:00:00Z",
-        "availability": {"status": "up"},
+        "availability": {"node_availability": 1.0, "link_availability": 1.0},
+        "usage": {"free_cpu_capacity": 8, "queue_length": 0, "load_index": 0.1},
     }
 
     with TestClient(app) as client:
@@ -367,8 +368,8 @@ def test_snapshot_submission_records_submitter_email(temp_database, monkeypatch)
 
     payload = {
         "ts": "2026-09-07T00:00:00Z",
-        "availability": {"status": "up"},
-        "usage": {"load_index": 0.2},
+        "availability": {"status": "up", "node_availability": 1.0, "link_availability": 1.0},
+        "usage": {"free_cpu_capacity": 8, "queue_length": 0, "load_index": 0.2},
         "efficiency": {"pue_estimate": 1.2},
         "quality": {"mock": True},
     }
@@ -405,6 +406,7 @@ def test_flat_uth_snapshot_submission_is_training_compatible(temp_database, monk
         "node_availability": 0.95,
         "link_availability": 0.98,
         "cpu_util_avg": 72.0,
+        "free_cpu_capacity": 8,
         "queue_length": 3,
         "remaining_jobs": 8,
         "load_index": 0.7,
@@ -437,4 +439,3 @@ def test_flat_uth_snapshot_submission_is_training_compatible(temp_database, monk
     assert status.operational_status == "DEGRADED"
     assert status.node_availability == 0.95
     assert status.queue_length == 3
-
