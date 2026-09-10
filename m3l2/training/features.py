@@ -26,6 +26,9 @@ STATUS_TARGET_COLUMNS = [
     "maintenance_flag",
     "node_availability",
     "link_availability",
+    "compute_capacity",
+    "gpu_capacity",
+    "storage_capacity",
     "free_cpu_capacity",
     "free_gpu_capacity",
     "queue_length",
@@ -115,7 +118,47 @@ def _status_score(value: str | None) -> float:
     }.get(str(value or "UP").upper(), 0.5)
 
 
+def _payload_number(payload: dict | None, names: tuple[str, ...]) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    for name in names:
+        value = payload.get(name)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _first_not_none(*values: float | None) -> float | None:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _capacity_targets(payload: dict | None) -> dict[str, float | None]:
+    capabilities = payload.get("capabilities") if isinstance(payload, dict) else None
+    return {
+        "compute_capacity": _first_not_none(
+            _payload_number(payload, ("compute_capacity", "total_vcpus", "vcpus_total", "cpu_capacity")),
+            _payload_number(capabilities, ("compute_capacity", "total_vcpus", "vcpus_total", "cpu_capacity")),
+        ),
+        "gpu_capacity": _first_not_none(
+            _payload_number(payload, ("gpu_capacity", "total_gpus", "gpus_total")),
+            _payload_number(capabilities, ("gpu_capacity", "total_gpus", "gpus_total")),
+        ),
+        "storage_capacity": _first_not_none(
+            _payload_number(payload, ("storage_capacity", "storage_gb", "total_disk_gb", "disk_gb_total")),
+            _payload_number(capabilities, ("storage_capacity", "storage_gb", "total_disk_gb", "disk_gb_total")),
+        ),
+    }
+
+
 def _status_training_row(row: SiteStatusSnapshot) -> dict:
+    capacity = _capacity_targets(row.raw_json)
     return {
         "site_id": row.site_id or "unknown-site",
         "ri_type": row.ri_type or "unknown",
@@ -124,6 +167,7 @@ def _status_training_row(row: SiteStatusSnapshot) -> dict:
         "maintenance_flag": 1.0 if row.maintenance_flag else 0.0,
         "node_availability": row.node_availability,
         "link_availability": row.link_availability,
+        **capacity,
         "free_cpu_capacity": row.free_cpu_capacity,
         "free_gpu_capacity": row.free_gpu_capacity,
         "queue_length": row.queue_length,
@@ -150,6 +194,7 @@ def _snapshot_training_row(snapshot: SiteSnapshot) -> dict | None:
         status = normalise_site_status(_snapshot_status_payload(snapshot))
     except ValueError:
         return None
+    capacity = _capacity_targets(snapshot.raw_json)
     return {
         "site_id": status["site_id"] or "unknown-site",
         "ri_type": status.get("ri_type") or "unknown",
@@ -158,6 +203,7 @@ def _snapshot_training_row(snapshot: SiteSnapshot) -> dict | None:
         "maintenance_flag": 1.0 if status.get("maintenance_flag") else 0.0,
         "node_availability": status.get("node_availability"),
         "link_availability": status.get("link_availability"),
+        **capacity,
         "free_cpu_capacity": status.get("free_cpu_capacity"),
         "free_gpu_capacity": status.get("free_gpu_capacity"),
         "queue_length": status.get("queue_length"),
@@ -193,6 +239,9 @@ def build_site_status_training_frame(session: Session, site_id: str | None = Non
 
     df["node_availability"] = pd.to_numeric(df["node_availability"], errors="coerce")
     df["link_availability"] = pd.to_numeric(df["link_availability"], errors="coerce")
+    df["compute_capacity"] = pd.to_numeric(df["compute_capacity"], errors="coerce")
+    df["gpu_capacity"] = pd.to_numeric(df["gpu_capacity"], errors="coerce")
+    df["storage_capacity"] = pd.to_numeric(df["storage_capacity"], errors="coerce")
     df["free_cpu_capacity"] = pd.to_numeric(df["free_cpu_capacity"], errors="coerce")
     df["free_gpu_capacity"] = pd.to_numeric(df["free_gpu_capacity"], errors="coerce")
     df["queue_length"] = pd.to_numeric(df["queue_length"], errors="coerce")
@@ -207,6 +256,9 @@ def build_site_status_training_frame(session: Session, site_id: str | None = Non
     df["link_availability"] = df["link_availability"].clip(lower=0.0, upper=1.0)
     df["free_cpu_capacity"] = df["free_cpu_capacity"].clip(lower=0.0)
     df["free_gpu_capacity"] = df["free_gpu_capacity"].fillna(0.0).clip(lower=0.0)
+    df["compute_capacity"] = df["compute_capacity"].fillna(df["free_cpu_capacity"]).clip(lower=0.0)
+    df["gpu_capacity"] = df["gpu_capacity"].fillna(df["free_gpu_capacity"]).clip(lower=0.0)
+    df["storage_capacity"] = df["storage_capacity"].fillna(0.0).clip(lower=0.0)
     df["queue_length"] = df["queue_length"].fillna(0.0).clip(lower=0.0)
     df["provisioning_delay_s"] = df["provisioning_delay_s"].fillna(0.0).clip(lower=0.0)
     inferred_load = (df["cpu_util_avg"].fillna(0.0) / 100.0) + (df["queue_length"] / 50.0)

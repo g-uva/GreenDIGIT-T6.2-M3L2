@@ -48,6 +48,9 @@ def snapshot(site_id: str, ts: datetime, index: int, step_minutes: int) -> dict:
             "generated_by": "scripts/submit_mock_site_snapshots.py",
             "site_id": site_id,
             "ri_type": "grid",
+            "compute_capacity": 64,
+            "gpu_capacity": 0,
+            "storage_capacity": 2048,
         },
         "availability": {
             "mock": True,

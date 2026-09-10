@@ -178,6 +178,8 @@ def test_hgbr_model_trains_and_predicts(temp_database, monkeypatch, tmp_path):
 
     bundle = joblib.load(result["path"])
     assert bundle["feature_schema"]["target"] == "l2_site_status"
+    assert "compute_capacity" in bundle["feature_schema"]["targets"]
+    assert "storage_capacity" in bundle["feature_schema"]["targets"]
     assert bundle["pipeline"].named_steps["model"].__class__.__name__ == "MultiOutputRegressor"
 
     prediction = predict(_predict_payload())
@@ -186,6 +188,8 @@ def test_hgbr_model_trains_and_predicts(temp_database, monkeypatch, tmp_path):
     assert prediction["target"] == "l2_site_status"
     assert prediction["results"][0]["forecast"][0]["unit"] == "ratio"
     assert prediction["results"][0]["site_status_forecast"][0]["inference_source"] == "model"
+    assert prediction["results"][0]["site_status_forecast"][0]["compute_capacity"] is not None
+    assert prediction["results"][0]["capacity"]["compute_capacity"] is not None
 
 
 def test_workload_specific_cache_isolation(temp_database, monkeypatch, tmp_path):
