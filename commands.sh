@@ -15,23 +15,6 @@ REQUEST=$(curl -sS -X POST "$API_BASE/auth/token" \
 
 TOKEN=$(echo "$REQUEST" | jq -r '.access_token')
 
-# Register or update the site before submitting snapshots.
-curl -sS -X POST "$API_BASE/l2/sites/register" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "site_id": "SLICES-GR-UTH",
-    "site_name": "SLICES-GR-UTH",
-    "ri_type": "grid",
-    "adapter_base_url": "http://127.0.0.1:8000/mock-l3/sites/SLICES-GR-UTH",
-    "contact_email": "greendigit@uth.gr",
-    "auth_type": "jwt",
-    "metadata": {
-      "eimps_site_name": "SLICES-GR-UTH",
-      "execution_records_site_id": "site_e726c7cce5"
-    }
-  }' | jq .
-
 # Submitting synthetic mock site snapshots. NO NEED TO DO IT.
 python3 scripts/submit_mock_site_snapshots.py \
   --base-url "$API_BASE" \

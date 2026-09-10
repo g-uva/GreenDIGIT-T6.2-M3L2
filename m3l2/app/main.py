@@ -432,7 +432,7 @@ def root() -> HTMLResponse:
             <h1>GreenDIGIT M3L2 API</h1>
             <h2>Operator access</h2>
             <div class="button-row">
-                <a class="button-link" href="/auth/login?next=/ops/config/ui&role=site_admin">Login to config</a>
+                <a class="button-link" href="/auth/login">Login/token</a>
                 <a class="button-link secondary" href="/docs">Open API Docs</a>
             </div>
             <div class="info">

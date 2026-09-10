@@ -179,6 +179,46 @@ def test_site_registration_and_telemetry_submission_do_not_require_eimps_records
     assert status.node_availability == 1.0
 
 
+def test_first_snapshot_submission_auto_registers_allowed_site(temp_database, monkeypatch):
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    with SessionLocal() as session:
+        session.add(AuthUser(email="publisher@uth.gr", password_hash="unused", enabled=True))
+        session.commit()
+
+    telemetry_payload = {
+        "timestamp": "2026-09-07T01:00:00Z",
+        "ri_type": "grid",
+        "operational_status": "UP",
+        "maintenance_flag": False,
+        "node_availability": 1.0,
+        "link_availability": 1.0,
+        "free_cpu_capacity": 8,
+        "queue_length": 0,
+        "load_index": 0.1,
+    }
+
+    with TestClient(app) as client:
+        submitted = client.post(
+            "/l2/sites/NEW-SITE/snapshots",
+            headers=_auth_header("publisher@uth.gr", "NEW-SITE", "publisher"),
+            json=telemetry_payload,
+        )
+
+    assert submitted.status_code == 200
+    assert submitted.json()["site_id"] == "NEW-SITE"
+    with SessionLocal() as session:
+        site = session.execute(select(RegisteredSite).where(RegisteredSite.site_id == "NEW-SITE")).scalars().first()
+        status = session.execute(select(SiteStatusSnapshot).where(SiteStatusSnapshot.site_id == "NEW-SITE")).scalars().first()
+
+    assert site is not None
+    assert site.site_name == "NEW-SITE"
+    assert site.ri_type == "grid"
+    assert site.contact_email == "publisher@uth.gr"
+    assert site.site_metadata == {"registration_source": "first_snapshot"}
+    assert status is not None
+    assert status.node_availability == 1.0
+
+
 def test_operator_config_requires_site_admin(temp_database, monkeypatch):
     monkeypatch.setenv("JWT_SECRET", "test-secret")
     _seed_site()
@@ -285,8 +325,8 @@ def test_operator_config_ui_marks_unavailable_features_disabled(temp_database, m
         response = client.get("/ops/config/ui")
 
     assert landing.status_code == 200
-    assert "Login to config" in landing.text
-    assert "/auth/login?next=/ops/config/ui&role=site_admin" in landing.text
+    assert "Login/token" in landing.text
+    assert "/auth/login" in landing.text
     assert response.status_code == 200
     text = response.text
     assert 'id="token"' not in text
@@ -310,7 +350,9 @@ def test_browser_login_issues_token_and_me_lists_user_sites(temp_database, tmp_p
     monkeypatch.setenv("ALLOWED_EMAILS_PATH", str(allowed))
 
     with TestClient(app) as client:
+        choice_page = client.get("/auth/login")
         login_page = client.get("/auth/login?next=/ops/config/ui&role=site_admin")
+        token_page = client.get("/auth/login/token")
         token_response = client.post(
             "/auth/token",
             json={
@@ -323,9 +365,16 @@ def test_browser_login_issues_token_and_me_lists_user_sites(temp_database, tmp_p
         token = token_response.json()["access_token"]
         me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
 
+    assert choice_page.status_code == 200
+    assert "Login/token" in choice_page.text
+    assert "/auth/login?next=/ops/config/ui&amp;role=site_admin" in choice_page.text
+    assert "/auth/login/token" in choice_page.text
     assert login_page.status_code == 200
     assert 'const nextUrl = "/ops/config/ui";' in login_page.text
     assert 'localStorage.setItem("m3l2_token", body.access_token)' in login_page.text
+    assert token_page.status_code == 200
+    assert 'action="/auth/login/token"' in token_page.text
+    assert "Get token" in token_page.text
     assert token_response.status_code == 200
     assert me.status_code == 200
     body = me.json()

@@ -250,14 +250,52 @@ def _token_result_html(payload: dict[str, Any]) -> HTMLResponse:
     )
 
 
-@router.get("/login", response_class=HTMLResponse, summary="HTML login page for a 24-hour JWT")
-def login_page(next: str = Query("/ops/config/ui"), role: str = Query("site_admin")) -> HTMLResponse:
-    safe_next = next if next.startswith("/") and not next.startswith("//") else "/ops/config/ui"
-    selected_role = role if role in VALID_ROLES else "site_admin"
-    role_options = "\n".join(
+def _role_options(selected_role: str) -> str:
+    return "\n".join(
         f'<option value="{option}"{" selected" if option == selected_role else ""}>{option}</option>'
         for option in ("reader", "publisher", "site_admin")
     )
+
+
+def _login_choice_html() -> HTMLResponse:
+    return HTMLResponse(
+        """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>M3L2 Login and Token</title>
+    <link rel="stylesheet" href="/static/auth.css">
+</head>
+<body>
+    <main class="auth-shell">
+        <section class="auth-panel">
+            <img src="/static/cropped-GD_logo.png" alt="GreenDIGIT" class="auth-logo">
+            <h1>GreenDIGIT M3L2 API</h1>
+            <h2>Login/token</h2>
+            <div class="button-row">
+                <a class="button-link" href="/auth/login?next=/ops/config/ui&role=site_admin">Login to config</a>
+                <a class="button-link secondary" href="/auth/login/token">Get token</a>
+            </div>
+            <div class="info">
+                <p>First login sets your password if your email is registered. Tokens are valid for 24 hours.</p>
+                <p>If your login does not work, please contact g.j.teixeiradepinhoferreira@uva.nl</p>
+            </div>
+            <footer class="grant-footer">
+                <p>This work is funded from the European Union's Horizon Europe research and innovation programme through the <a href="https://greendigit-project.eu/" target="_blank" rel="noopener">GreenDIGIT project</a>, under Grant Agreement No. <a href="https://cordis.europa.eu/project/id/101131207" target="_blank" rel="noopener">101131207</a>.</p>
+                <img src="/static/EN-Funded-by-the-EU-POS-2.png" alt="Funded by the European Union">
+            </footer>
+        </section>
+    </main>
+</body>
+</html>"""
+    )
+
+
+def _config_login_html(next: str, role: str) -> HTMLResponse:
+    safe_next = next if next.startswith("/") and not next.startswith("//") else "/ops/config/ui"
+    selected_role = role if role in VALID_ROLES else "site_admin"
+    role_options = _role_options(selected_role)
     page = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -330,6 +368,74 @@ def login_page(next: str = Query("/ops/config/ui"), role: str = Query("site_admi
 </body>
 </html>"""
     return HTMLResponse(page.replace("__ROLE_OPTIONS__", role_options).replace("__NEXT_URL__", html.escape(safe_next, quote=True)))
+
+
+def _token_login_html(role: str = "reader") -> HTMLResponse:
+    selected_role = role if role in VALID_ROLES else "reader"
+    role_options = _role_options(selected_role)
+    page = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>M3L2 API Token Login</title>
+    <link rel="stylesheet" href="/static/auth.css">
+</head>
+<body>
+    <main class="auth-shell">
+        <section class="auth-panel">
+            <img src="/static/cropped-GD_logo.png" alt="GreenDIGIT" class="auth-logo">
+            <h1>GreenDIGIT M3L2 API</h1>
+            <h2>Get token</h2>
+            <form method="post" action="/auth/login/token">
+                <input name="email" type="email" placeholder="Email" autocomplete="email" required>
+                <input name="password" type="password" placeholder="Password" autocomplete="current-password" required>
+                <input name="site_id" type="text" placeholder="Site ID, e.g. UTH-IOT">
+                <select name="role">
+                    __ROLE_OPTIONS__
+                </select>
+                <button type="submit">Get token</button>
+            </form>
+            <div class="button-row">
+                <a class="button-link secondary" href="/auth/login?next=/ops/config/ui&role=site_admin">Login to config</a>
+                <a class="button-link secondary" href="/docs">Open API Docs</a>
+            </div>
+            <div class="info">
+                <p>Use the generated token as <code>Authorization: Bearer &lt;token&gt;</code>.</p>
+            </div>
+            <footer class="grant-footer">
+                <p>This work is funded from the European Union's Horizon Europe research and innovation programme through the <a href="https://greendigit-project.eu/" target="_blank" rel="noopener">GreenDIGIT project</a>, under Grant Agreement No. <a href="https://cordis.europa.eu/project/id/101131207" target="_blank" rel="noopener">101131207</a>.</p>
+                <img src="/static/EN-Funded-by-the-EU-POS-2.png" alt="Funded by the European Union">
+            </footer>
+        </section>
+    </main>
+</body>
+</html>"""
+    return HTMLResponse(page.replace("__ROLE_OPTIONS__", role_options))
+
+
+@router.get("/login", response_class=HTMLResponse, summary="HTML login/token choice page")
+def login_page(next: str | None = Query(None), role: str = Query("site_admin")) -> HTMLResponse:
+    if next is None:
+        return _login_choice_html()
+    return _config_login_html(next, role)
+
+
+@router.get("/login/token", response_class=HTMLResponse, summary="HTML login page that displays a 24-hour JWT")
+def token_login_page(role: str = Query("reader")) -> HTMLResponse:
+    return _token_login_html(role)
+
+
+@router.post("/login/token", response_class=HTMLResponse, summary="Login and display a 24-hour JWT")
+async def token_login(request: Request, session: Session = Depends(get_db)) -> HTMLResponse:
+    form = await request.form()
+    token_request = TokenRequest(
+        email=str(form.get("email") or ""),
+        password=str(form.get("password") or ""),
+        site_id=str(form.get("site_id") or "") or None,
+        role=str(form.get("role") or "reader"),
+    )
+    return _token_result_html(_issue_token(session, token_request))
 
 
 @router.post("/login", response_class=HTMLResponse, summary="Login and display a 24-hour JWT")
