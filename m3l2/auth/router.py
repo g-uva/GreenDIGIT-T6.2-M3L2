@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from m3l2.app.config import get_settings
-from m3l2.app.db import AuthUser, SessionLocal, utc_now
+from m3l2.app.db import AuthUser, RegisteredSite, SessionLocal, utc_now
 from m3l2.site_adapter.auth import SitePrincipal, create_site_jwt, current_principal
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -93,6 +93,27 @@ def _access_for(email: str) -> list[AllowedAccess]:
 
 def _site_options(access: list[AllowedAccess]) -> list[str]:
     return sorted({entry.site_id for entry in access if entry.site_id})
+
+
+def _access_payload(
+    access: list[AllowedAccess],
+    registered_sites: dict[str, RegisteredSite] | None = None,
+) -> list[dict[str, Any]]:
+    roles_by_site: dict[str | None, set[str]] = {}
+    for entry in access:
+        roles_by_site.setdefault(entry.site_id, set()).update(entry.roles)
+
+    payload = []
+    for site_id, roles in sorted(roles_by_site.items(), key=lambda item: item[0] or ""):
+        item: dict[str, Any] = {"site_id": site_id, "roles": sorted(roles)}
+        if site_id:
+            registered = (registered_sites or {}).get(site_id)
+            item["registered"] = registered is not None
+            if registered is not None:
+                item["site_name"] = registered.site_name
+                item["ri_type"] = registered.ri_type
+        payload.append(item)
+    return payload
 
 
 def _roles_for_site(access: list[AllowedAccess], site_id: str) -> set[str]:
@@ -210,8 +231,12 @@ def _token_result_html(payload: dict[str, Any]) -> HTMLResponse:
             <label class="token-label" for="access-token">Access Token</label>
             <textarea id="access-token" readonly>{token}</textarea>
             <button type="button" onclick="navigator.clipboard.writeText(document.getElementById('access-token').value)">Copy Token</button>
+            <script>
+                localStorage.setItem("m3l2_token", "{token}");
+                localStorage.setItem("m3l2_principal", JSON.stringify({{"email": "{email}", "site_id": "{site_id}", "role": "{role}"}}));
+            </script>
             <div class="button-row">
-                <a class="button-link" href="/auth/login">Generate Another Token</a>
+                <a class="button-link" href="/ops/config/ui">Open Config</a>
                 <a class="button-link secondary" href="/docs">Open API Docs</a>
             </div>
             <footer class="grant-footer">
@@ -226,9 +251,14 @@ def _token_result_html(payload: dict[str, Any]) -> HTMLResponse:
 
 
 @router.get("/login", response_class=HTMLResponse, summary="HTML login page for a 24-hour JWT")
-def login_page() -> HTMLResponse:
-    return HTMLResponse(
-        """<!DOCTYPE html>
+def login_page(next: str = Query("/ops/config/ui"), role: str = Query("site_admin")) -> HTMLResponse:
+    safe_next = next if next.startswith("/") and not next.startswith("//") else "/ops/config/ui"
+    selected_role = role if role in VALID_ROLES else "site_admin"
+    role_options = "\n".join(
+        f'<option value="{option}"{" selected" if option == selected_role else ""}>{option}</option>'
+        for option in ("reader", "publisher", "site_admin")
+    )
+    page = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -241,17 +271,15 @@ def login_page() -> HTMLResponse:
         <section class="auth-panel">
             <img src="/static/cropped-GD_logo.png" alt="GreenDIGIT" class="auth-logo">
             <h1>GreenDIGIT M3L2 API</h1>
-            <h2>Login to generate token</h2>
+            <h2>Login to config</h2>
             <form id="token-form">
                 <input id="email" name="email" type="email" placeholder="Email" autocomplete="email" required>
                 <input id="password" name="password" type="password" placeholder="Password" autocomplete="current-password" required>
                 <input id="site_id" name="site_id" type="text" placeholder="Site ID, e.g. UTH-IOT">
                 <select id="role" name="role">
-                    <option value="reader">reader</option>
-                    <option value="publisher">publisher</option>
-                    <option value="site_admin">site_admin</option>
+                    __ROLE_OPTIONS__
                 </select>
-                <button type="submit">Get Token</button>
+                <button type="submit">Login to config</button>
             </form>
             <p id="error" class="error" hidden></p>
             <div class="info">
@@ -267,6 +295,7 @@ def login_page() -> HTMLResponse:
     <script>
         const form = document.getElementById("token-form");
         const error = document.getElementById("error");
+        const nextUrl = "__NEXT_URL__";
         form.addEventListener("submit", async (event) => {
             event.preventDefault();
             error.hidden = true;
@@ -276,15 +305,15 @@ def login_page() -> HTMLResponse:
                 site_id: document.getElementById("site_id").value.trim() || null,
                 role: document.getElementById("role").value,
             };
-            const response = await fetch("/auth/login", {
+            const response = await fetch("/auth/token", {
                 method: "POST",
                 headers: {"Content-Type": "application/json"},
                 body: JSON.stringify(payload),
             });
-            const text = await response.text();
+            const bodyText = await response.text();
             if (!response.ok) {
                 try {
-                    const body = JSON.parse(text);
+                    const body = JSON.parse(bodyText);
                     error.textContent = body.detail || "Login failed";
                 } catch {
                     error.textContent = "Login failed";
@@ -292,14 +321,15 @@ def login_page() -> HTMLResponse:
                 error.hidden = false;
                 return;
             }
-            document.open();
-            document.write(text);
-            document.close();
+            const body = JSON.parse(bodyText);
+            localStorage.setItem("m3l2_token", body.access_token);
+            localStorage.setItem("m3l2_principal", JSON.stringify({email: body.email, site_id: body.site_id, role: body.role}));
+            window.location.href = nextUrl;
         });
     </script>
 </body>
 </html>"""
-    )
+    return HTMLResponse(page.replace("__ROLE_OPTIONS__", role_options).replace("__NEXT_URL__", html.escape(safe_next, quote=True)))
 
 
 @router.post("/login", response_class=HTMLResponse, summary="Login and display a 24-hour JWT")
@@ -326,3 +356,26 @@ def token_query(
 @router.get("/verify-token", summary="Validate a Bearer token")
 def verify_token(principal: SitePrincipal = Depends(current_principal)) -> dict[str, Any]:
     return {"valid": True, "email": principal.email, "site_id": principal.site_id, "role": principal.role}
+
+
+@router.get("/me", summary="Return the authenticated user, role, and allowed sites")
+def me(principal: SitePrincipal = Depends(current_principal)) -> dict[str, Any]:
+    access = _access_for(principal.email)
+    roles_for_current_site = sorted(_roles_for_site(access, principal.site_id)) if access else [principal.role]
+    site_ids = [entry.site_id for entry in access if entry.site_id]
+    registered_sites: dict[str, RegisteredSite] = {}
+    if site_ids:
+        with SessionLocal() as session:
+            rows = session.execute(select(RegisteredSite).where(RegisteredSite.site_id.in_(site_ids))).scalars()
+            registered_sites = {row.site_id: row for row in rows}
+    return {
+        "email": principal.email,
+        "site_id": principal.site_id,
+        "role": principal.role,
+        "roles_for_current_site": roles_for_current_site,
+        "sites": (
+            _access_payload(access, registered_sites)
+            if access
+            else [{"site_id": principal.site_id, "roles": [principal.role], "registered": False}]
+        ),
+    }

@@ -1,4 +1,4 @@
-# 🌱🌍♻️ WP6.2 Multi-Level Heterogeneous ML Pipeline (GreenDIGIT Project)
+# 🌱🌍♻️ T6.2 Multi-Level Machine Learning Pipeline (GreenDIGIT Project)
 
 *This work is funded from the European Union’s Horizon Europe research and innovation programme through the [GreenDIGIT project](https://greendigit-project.eu/), under the grant agreement No. [101131207](https://cordis.europa.eu/project/id/101131207)*.
 
@@ -6,13 +6,6 @@
   <img src="static/EN-Funded-by-the-EU-POS-2.png" alt="EU Logo" width="250px">
   <img src="static/cropped-GD_logo.png" alt="GreenDIGIT Logo" width="110px" style="margin-right:100px">
 </div>
-
-
->**Disclaimer**: the information on this README is still temporary. The tools, architecture and other specifications are subject to change.
-
-> Part of GreenDIGIT WP6.2 — Predictive AI for Federated Energy-Aware Workflows  
-> Developed in collaboration with SoBigData RI, IFCA, DIRAC, and GreenDIGIT RIs and partners.
-
 
 ## Overview
 
@@ -144,9 +137,11 @@ Key M3L2 configuration:
 - `M3L2_FORECAST_STEP_MINUTES`: default step for recurrent forecast refresh.
 - `M3L2_MIN_TRAINING_RECORDS`: minimum usable site-telemetry records required before training.
 
-Operational training and forecast settings can also be changed at runtime by a `site_admin` from:
+Operational training and forecast settings can also be changed at runtime by a `site_admin` from the main page
+or directly from:
 
 ```text
+http://localhost:8000/
 http://localhost:8000/ops/config/ui
 ```
 
@@ -263,14 +258,16 @@ Registered operator-facing site IDs such as `SLICES-GR-UTH` are resolved through
 
 ### L2 Site Adapter login and tokens
 
-Open the login page:
+Open the main page or login page:
 
 ```bash
+http://localhost/
 http://localhost/auth/login
 ```
 
 Token issuance is gated by `allowed_emails.txt` at the repository root. First login sets the password for an allowed email; subsequent logins must use the same password.
 Protected L2 endpoints also check `SITE_ADAPTER_ALLOWED_EMAIL_DOMAINS`; include the domains of any non-institutional allowed emails, such as `gmail.com`, or set it empty to rely only on the explicit allow-list.
+Browser logins store the 24-hour token locally for the operator configuration UI. Authenticated clients can call `GET /auth/me` to see the current email, token role, token site, roles for that site, and the sites listed for that email, including registration status and registered site metadata when available.
 
 Supported allow-list formats:
 

@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import Body, Depends, FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
@@ -415,8 +415,38 @@ app.include_router(mock_broker_router)
 
 
 @app.get("/", include_in_schema=False)
-def root() -> RedirectResponse:
-    return RedirectResponse(url="/auth/login")
+def root() -> HTMLResponse:
+    return HTMLResponse(
+        """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GreenDIGIT M3L2</title>
+    <link rel="stylesheet" href="/static/auth.css">
+</head>
+<body>
+    <main class="auth-shell">
+        <section class="auth-panel">
+            <img src="/static/cropped-GD_logo.png" alt="GreenDIGIT" class="auth-logo">
+            <h1>GreenDIGIT M3L2 API</h1>
+            <h2>Operator access</h2>
+            <div class="button-row">
+                <a class="button-link" href="/auth/login?next=/ops/config/ui&role=site_admin">Login to config</a>
+                <a class="button-link secondary" href="/docs">Open API Docs</a>
+            </div>
+            <div class="info">
+                <p>Site telemetry endpoints accept authorised submissions independently from EIMPS.</p>
+            </div>
+            <footer class="grant-footer">
+                <p>This work is funded from the European Union's Horizon Europe research and innovation programme through the <a href="https://greendigit-project.eu/" target="_blank" rel="noopener">GreenDIGIT project</a>, under Grant Agreement No. <a href="https://cordis.europa.eu/project/id/101131207" target="_blank" rel="noopener">101131207</a>.</p>
+                <img src="/static/EN-Funded-by-the-EU-POS-2.png" alt="Funded by the European Union">
+            </footer>
+        </section>
+    </main>
+</body>
+</html>"""
+    )
 
 
 @app.get("/health", tags=["m3l2-ops"])
@@ -453,8 +483,11 @@ def operator_config_page() -> HTMLResponse:
         .inline-check { display: flex; align-items: center; gap: 8px; margin: 10px 0; color: #4b5563; }
         .inline-check input { width: auto; }
         .button-row { display: flex; gap: 10px; flex-wrap: wrap; }
+        .button-row button { flex: 1 1 140px; }
         pre { white-space: pre-wrap; word-break: break-word; background: #111827; color: #e5e7eb; padding: 12px; border-radius: 8px; font-size: 0.82rem; }
         .status-line { min-height: 1.4rem; color: #374151; }
+        .site-picker { display: grid; gap: 6px; color: #243042; font-size: 0.92rem; margin-bottom: 14px; }
+        .logout-button { background: #5f6b63; }
     </style>
 </head>
 <body>
@@ -462,9 +495,15 @@ def operator_config_page() -> HTMLResponse:
         <section class="auth-panel auth-panel-wide">
             <img src="/static/cropped-GD_logo.png" alt="GreenDIGIT" class="auth-logo">
             <h1>M3L2 Operator Configuration</h1>
+            <dl class="token-meta">
+                <div><dt>Email</dt><dd id="user-email">-</dd></div>
+                <div><dt>Current site</dt><dd id="user-site">-</dd></div>
+                <div><dt>Role</dt><dd id="user-role">-</dd></div>
+            </dl>
             <form id="config-form">
-                <input id="token" type="password" placeholder="Bearer token" autocomplete="off" required>
-                <input id="site-id" type="text" placeholder="Site override ID, optional">
+                <label class="site-picker">Configuration scope
+                    <select id="site-id"></select>
+                </label>
                 <label class="inline-check"><input type="checkbox" disabled> Connect to EIMPS <span>Not yet available</span></label>
                 <div class="config-grid">
                     <label>Automatic training <select id="automatic_training"><option value="true">Enabled</option><option value="false">Manual</option></select></label>
@@ -484,6 +523,7 @@ def operator_config_page() -> HTMLResponse:
                     <button type="button" id="load">Load</button>
                     <button type="submit">Save</button>
                     <button type="button" id="train">Train now</button>
+                    <button type="button" id="logout" class="logout-button">Logout</button>
                 </div>
             </form>
             <p id="status" class="status-line"></p>
@@ -496,10 +536,37 @@ def operator_config_page() -> HTMLResponse:
     <script>
         const fields = ["training_frequency_hours", "training_window_hours", "min_usable_records", "forecast_horizon_hours", "forecast_step_minutes", "forecast_refresh_minutes", "aggregation_interval_minutes", "submission_cadence_minutes", "staleness_limit_minutes", "minimum_coverage_ratio", "model_name", "automatic_training"];
         const status = document.getElementById("status");
+        const loginUrl = "/auth/login?next=/ops/config/ui&role=site_admin";
+        let principal = null;
+        const token = () => localStorage.getItem("m3l2_token") || "";
         const siteId = () => document.getElementById("site-id").value.trim();
-        const auth = () => ({Authorization: `Bearer ${document.getElementById("token").value.trim()}`});
+        const auth = () => ({Authorization: `Bearer ${token()}`});
         const suffix = () => siteId() ? `?site_id=${encodeURIComponent(siteId())}` : "";
         function setStatus(text) { status.textContent = text; }
+        function requireToken() {
+            if (!token()) window.location.href = loginUrl;
+        }
+        function renderPrincipal(user) {
+            document.getElementById("user-email").textContent = user.email || "-";
+            document.getElementById("user-site").textContent = user.site_id || "-";
+            document.getElementById("user-role").textContent = user.role || "-";
+            const select = document.getElementById("site-id");
+            if (select.options.length) return;
+            select.append(new Option("Service defaults", ""));
+            for (const entry of user.sites || []) {
+                if (!entry.site_id) continue;
+                const roles = (entry.roles || []).join(", ");
+                const siteName = entry.site_name ? ` - ${entry.site_name}` : "";
+                const registration = entry.registered ? "registered" : "not registered";
+                const option = new Option(`${entry.site_id}${siteName} (${roles || "no roles"}; ${registration})`, entry.site_id);
+                if (entry.site_id !== user.site_id) {
+                    option.disabled = true;
+                    option.textContent += " - login required";
+                }
+                select.append(option);
+            }
+            select.value = user.site_id || "";
+        }
         function fill(config) {
             const effective = config.effective || {};
             for (const field of fields) {
@@ -520,12 +587,21 @@ def operator_config_page() -> HTMLResponse:
             return out;
         }
         async function jsonFetch(url, options = {}) {
+            requireToken();
             const response = await fetch(url, {...options, headers: {...auth(), "Content-Type": "application/json", ...(options.headers || {})}});
             const body = await response.json();
             if (!response.ok) throw new Error(JSON.stringify(body.detail || body));
             return body;
         }
+        async function ensurePrincipal() {
+            if (!principal) {
+                principal = await jsonFetch("/auth/me");
+                renderPrincipal(principal);
+            }
+            return principal;
+        }
         async function loadAll() {
+            await ensurePrincipal();
             const config = await jsonFetch(`/ops/config${suffix()}`);
             fill(config);
             const readiness = await jsonFetch(`/ops/training/readiness${suffix()}`);
@@ -547,6 +623,17 @@ def operator_config_page() -> HTMLResponse:
                 document.getElementById("readiness").textContent = JSON.stringify(result, null, 2);
                 setStatus("Training request completed.");
             } catch (error) { setStatus(error.message); }
+        });
+        document.getElementById("site-id").addEventListener("change", () => loadAll().catch(error => setStatus(error.message)));
+        document.getElementById("logout").addEventListener("click", () => {
+            localStorage.removeItem("m3l2_token");
+            localStorage.removeItem("m3l2_principal");
+            window.location.href = loginUrl;
+        });
+        loadAll().catch(error => {
+            localStorage.removeItem("m3l2_token");
+            localStorage.removeItem("m3l2_principal");
+            window.location.href = loginUrl;
         });
     </script>
 </body>

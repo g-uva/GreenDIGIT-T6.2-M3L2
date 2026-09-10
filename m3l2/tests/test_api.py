@@ -281,14 +281,60 @@ def test_operator_config_ui_marks_unavailable_features_disabled(temp_database, m
     monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
 
     with TestClient(app) as client:
+        landing = client.get("/")
         response = client.get("/ops/config/ui")
 
+    assert landing.status_code == 200
+    assert "Login to config" in landing.text
+    assert "/auth/login?next=/ops/config/ui&role=site_admin" in landing.text
     assert response.status_code == 200
     text = response.text
+    assert 'id="token"' not in text
+    assert "localStorage.getItem(\"m3l2_token\")" in text
+    assert "/auth/me" in text
+    assert "Configuration scope" in text
     assert "Connect to EIMPS" in text
     assert "Not yet available" in text
     assert '<option value="xgb" disabled>' in text
     assert '<option value="lstm" disabled>' in text
+
+
+def test_browser_login_issues_token_and_me_lists_user_sites(temp_database, tmp_path, monkeypatch):
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    allowed = tmp_path / "allowed_emails.txt"
+    allowed.write_text(
+        "operator@uth.gr,SLICES-GR-UTH,site_admin|publisher\n"
+        "operator@uth.gr,OTHER-SITE,reader\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ALLOWED_EMAILS_PATH", str(allowed))
+
+    with TestClient(app) as client:
+        login_page = client.get("/auth/login?next=/ops/config/ui&role=site_admin")
+        token_response = client.post(
+            "/auth/token",
+            json={
+                "email": "operator@uth.gr",
+                "password": "correct horse battery staple",
+                "site_id": "SLICES-GR-UTH",
+                "role": "site_admin",
+            },
+        )
+        token = token_response.json()["access_token"]
+        me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+
+    assert login_page.status_code == 200
+    assert 'const nextUrl = "/ops/config/ui";' in login_page.text
+    assert 'localStorage.setItem("m3l2_token", body.access_token)' in login_page.text
+    assert token_response.status_code == 200
+    assert me.status_code == 200
+    body = me.json()
+    assert body["email"] == "operator@uth.gr"
+    assert body["site_id"] == "SLICES-GR-UTH"
+    assert body["role"] == "site_admin"
+    assert body["roles_for_current_site"] == ["publisher", "site_admin"]
+    assert {"site_id": "OTHER-SITE", "roles": ["reader"], "registered": False} in body["sites"]
+    assert {"site_id": "SLICES-GR-UTH", "roles": ["publisher", "site_admin"], "registered": False} in body["sites"]
 
 
 def test_l2_site_reads_return_authenticated_site_data(temp_database, monkeypatch):

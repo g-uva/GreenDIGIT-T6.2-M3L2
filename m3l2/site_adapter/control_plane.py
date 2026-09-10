@@ -112,6 +112,31 @@ def _load_site(session: Session, site_id: str) -> RegisteredSite:
     return site
 
 
+def _ensure_site_registered(session: Session, site_id: str, principal: SitePrincipal, payload: dict[str, Any]) -> RegisteredSite:
+    site = session.execute(select(RegisteredSite).where(RegisteredSite.site_id == site_id)).scalar_one_or_none()
+    if site is not None:
+        if not site.enabled:
+            raise HTTPException(status_code=409, detail=f"Registered site is disabled: {site_id}")
+        return site
+
+    ri_type = str(payload.get("ri_type") or (payload.get("capabilities") or {}).get("ri_type") or "unknown").lower()
+    site = RegisteredSite(
+        site_id=site_id,
+        site_name=site_id,
+        ri_type=ri_type,
+        adapter_base_url=f"auto://{site_id}",
+        contact_email=principal.email,
+        auth_type="jwt",
+        auth_config={},
+        enabled=True,
+        registered_at=utc_now(),
+        site_metadata={"registration_source": "first_snapshot"},
+    )
+    session.add(site)
+    session.flush()
+    return site
+
+
 def _auth_config(payload: SiteRegistrationRequest) -> dict[str, Any]:
     if payload.auth_type == "egi_checkin":
         settings = get_settings()
@@ -257,8 +282,8 @@ def push_snapshot(
     session: Session = Depends(get_db),
 ) -> dict[str, Any]:
     require_same_site(principal, site_id)
-    _load_site(session, site_id)
     body = model_dump(payload)
+    _ensure_site_registered(session, site_id, principal, body)
     snapshot_ts = payload.ts or body.get("timestamp")
     snapshot = store_snapshot(
         session,
