@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from m3l2.app.db import AuthUser, OperatorConfig, RegisteredSite, SessionLocal, SiteProfile, SiteSnapshot, SiteStatusSnapshot
+from m3l2.app.db import AuthUser, OperatorConfig, RegisteredSite, SessionLocal, SiteSnapshot, SiteStatusSnapshot
 from m3l2.app.main import app
 from m3l2.site_adapter.auth import create_site_jwt
 
@@ -34,6 +34,12 @@ def test_legacy_predict_routes_are_hidden_from_openapi(temp_database, monkeypatc
     assert "/l2/predict" in schema["paths"]
     assert "/predict" not in schema["paths"]
     assert "/predict/batch" not in schema["paths"]
+    assert "/mock-broker/submit" not in schema["paths"]
+    assert "/l2/sites/register" not in schema["paths"]
+    assert "/site-profiles" not in schema["paths"]
+    assert "/site-status" not in schema["paths"]
+    assert "/site-status/latest" not in schema["paths"]
+    assert not any(path.startswith("/mock-l3") for path in schema["paths"])
     operation_tags = [
         tag
         for path in schema["paths"].values()
@@ -53,7 +59,7 @@ def _seed_site() -> None:
                 site_id="SLICES-GR-UTH",
                 site_name="SLICES-GR-UTH",
                 ri_type="grid",
-                adapter_base_url="http://127.0.0.1:8000/mock-l3/sites/SLICES-GR-UTH",
+                adapter_base_url="auto://SLICES-GR-UTH",
                 contact_email="reader@uth.gr",
             )
         )
@@ -86,19 +92,6 @@ def test_l2_site_adapter_endpoints_require_bearer_token(temp_database, monkeypat
         "ts": "2026-09-07T00:00:00Z",
         "availability": {"status": "up"},
     }
-    register_payload = {
-        "site_id": "SLICES-GR-UTH",
-        "site_name": "SLICES-GR-UTH",
-        "ri_type": "grid",
-        "adapter_base_url": "http://127.0.0.1:8000/mock-l3/sites/SLICES-GR-UTH",
-        "contact_email": "reader@uth.gr",
-    }
-    workload_payload = {
-        "workload_id": "workload-1",
-        "workload_type": "batch",
-        "requirements": {},
-        "metadata": {},
-    }
 
     with TestClient(app) as client:
         checks = [
@@ -110,10 +103,7 @@ def test_l2_site_adapter_endpoints_require_bearer_token(temp_database, monkeypat
             client.get("/l2/sites/SLICES-GR-UTH/availability"),
             client.get("/l2/sites/SLICES-GR-UTH/usage"),
             client.get("/l2/sites/SLICES-GR-UTH/efficiency"),
-            client.post("/l2/sites/SLICES-GR-UTH/pull"),
             client.post("/l2/sites/SLICES-GR-UTH/snapshots", json=snapshot_payload),
-            client.post("/l2/sites/SLICES-GR-UTH/submit-workload", json=workload_payload),
-            client.post("/l2/sites/register", json=register_payload),
         ]
 
     assert {response.status_code for response in checks} == {401}
@@ -132,51 +122,6 @@ def test_l2_predict_requires_model_after_bearer_token(temp_database, monkeypatch
 
     assert response.status_code == 503
     assert response.json()["status"] == "no_active_model"
-
-
-def test_site_registration_and_telemetry_submission_do_not_require_eimps_records(temp_database, monkeypatch):
-    monkeypatch.setenv("JWT_SECRET", "test-secret")
-    with SessionLocal() as session:
-        session.add(AuthUser(email="admin@uth.gr", password_hash="unused", enabled=True))
-        session.commit()
-
-    register_payload = {
-        "site_id": "NEW-SITE",
-        "site_name": "New Site",
-        "ri_type": "network",
-        "adapter_base_url": "http://127.0.0.1:8000/mock-l3/sites/NEW-SITE",
-        "contact_email": "admin@uth.gr",
-    }
-    telemetry_payload = {
-        "timestamp": "2026-09-07T01:00:00Z",
-        "ri_type": "network",
-        "operational_status": "UP",
-        "maintenance_flag": False,
-        "node_availability": 1.0,
-        "link_availability": 1.0,
-        "free_cpu_capacity": 8,
-        "queue_length": 0,
-        "load_index": 0.1,
-    }
-
-    with TestClient(app) as client:
-        registered = client.post(
-            "/l2/sites/register",
-            headers=_auth_header("admin@uth.gr", "NEW-SITE", "site_admin"),
-            json=register_payload,
-        )
-        submitted = client.post(
-            "/l2/sites/NEW-SITE/snapshots",
-            headers=_auth_header("admin@uth.gr", "NEW-SITE", "site_admin"),
-            json=telemetry_payload,
-        )
-
-    assert registered.status_code == 200
-    assert submitted.status_code == 200
-    with SessionLocal() as session:
-        status = session.execute(select(SiteStatusSnapshot).where(SiteStatusSnapshot.site_id == "NEW-SITE")).scalars().first()
-    assert status is not None
-    assert status.node_availability == 1.0
 
 
 def test_first_snapshot_submission_auto_registers_allowed_site(temp_database, monkeypatch):
@@ -367,13 +312,15 @@ def test_browser_login_issues_token_and_me_lists_user_sites(temp_database, tmp_p
 
     assert choice_page.status_code == 200
     assert "Login/token" in choice_page.text
-    assert "/auth/login?next=/ops/config/ui&amp;role=site_admin" in choice_page.text
+    assert "/auth/login?next=/ops/config/ui&role=site_admin" in choice_page.text
     assert "/auth/login/token" in choice_page.text
     assert login_page.status_code == 200
     assert 'const nextUrl = "/ops/config/ui";' in login_page.text
     assert 'localStorage.setItem("m3l2_token", body.access_token)' in login_page.text
     assert token_page.status_code == 200
-    assert 'action="/auth/login/token"' in token_page.text
+    assert 'id="token-form"' in token_page.text
+    assert 'id="access-token"' in token_page.text
+    assert 'fetch("/auth/token"' in token_page.text
     assert "Get token" in token_page.text
     assert token_response.status_code == 200
     assert me.status_code == 200
@@ -491,133 +438,3 @@ def test_flat_uth_snapshot_submission_is_training_compatible(temp_database, monk
     assert status.node_availability == 0.95
     assert status.queue_length == 3
 
-
-def test_site_status_batch_validation_prevents_partial_persistence(temp_database, monkeypatch):
-    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
-    payload = [
-        {
-            "site_id": "SITE-OK",
-            "ri_type": "grid",
-            "timestamp": "2026-09-08T07:00:00Z",
-            "node_availability": 0.9,
-        },
-        {
-            "site_id": "SITE-BAD",
-            "ri_type": "grid",
-            "node_availability": 1.2,
-        },
-    ]
-
-    with TestClient(app) as client:
-        response = client.post("/site-status", json=payload)
-
-    assert response.status_code == 422
-    fields = {tuple(error["loc"]) for error in response.json()["detail"]}
-    assert ("body", 1, "timestamp") in fields
-    assert ("body", 1, "node_availability") in fields
-    with SessionLocal() as session:
-        count = session.query(SiteStatusSnapshot).count()
-    assert count == 0
-
-
-def test_site_profile_alias_conflict_returns_field_error(temp_database, monkeypatch):
-    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
-    payload = {
-        "site_id": "SLICES-GR-UTH",
-        "site": "OTHER-SITE",
-        "ri_type": "grid",
-    }
-
-    with TestClient(app) as client:
-        response = client.post("/site-profiles?adapter_type=iot", json=payload)
-
-    assert response.status_code == 422
-    assert response.json()["detail"][0]["loc"] == ["body", "site_id"]
-    with SessionLocal() as session:
-        count = session.query(SiteProfile).count()
-    assert count == 0
-
-
-def test_profile_extensions_are_warned_and_returned(temp_database, monkeypatch):
-    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
-    payload = {
-        "site_id": "SLICES-GR-UTH",
-        "ri_type": "grid",
-        "location": "UTH",
-        "local_owner": "uth",
-        "extensions": {"sensor_generation": "v2"},
-    }
-
-    with TestClient(app) as client:
-        submit = client.post("/site-profiles", json=payload)
-        listed = client.get("/site-profiles")
-
-    assert submit.status_code == 200
-    assert submit.json()["warnings"] == [{"index": 0, "fields": ["local_owner", "sensor_generation"]}]
-    profile = listed.json()[0]
-    assert profile["extensions"] == {"local_owner": "uth", "sensor_generation": "v2"}
-
-
-def test_iot_status_round_trip_preserves_uth_fields_and_zero_false_values(temp_database, monkeypatch):
-    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
-    payload = {
-        "site": "SLICES-GR-UTH",
-        "ri_type": "network",
-        "ts": "2026-09-08T07:00:00Z",
-        "alive_nodes": 0,
-        "total_nodes": 10,
-        "active_links": 0,
-        "total_links": 5,
-        "cpu_utilization": 0,
-        "stability": 1.0,
-        "stale": False,
-        "lab_phase": "pilot",
-    }
-
-    with TestClient(app) as client:
-        submit = client.post("/site-status?adapter_type=iot", json=payload)
-        latest = client.get("/site-status/latest?site_id=SLICES-GR-UTH")
-
-    assert submit.status_code == 200
-    assert submit.json()["warnings"] == [{"index": 0, "fields": ["lab_phase"]}]
-    status = latest.json()[0]
-    assert status["ri_type"] == "network"
-    assert status["node_availability"] == 0.0
-    assert status["link_availability"] == 0.0
-    assert status["cpu_util_avg"] == 0.0
-    assert status["stability_score"] == 1.0
-    assert status["stale_flag"] is False
-    assert status["extensions"] == {"lab_phase": "pilot"}
-
-
-def test_iot_status_rejects_conflicting_explicit_and_derived_availability(temp_database, monkeypatch):
-    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
-    payload = {
-        "site_id": "SLICES-GR-UTH",
-        "ri_type": "network",
-        "timestamp": "2026-09-08T07:00:00Z",
-        "node_availability": 0.5,
-        "alive_nodes": 9,
-        "total_nodes": 10,
-    }
-
-    with TestClient(app) as client:
-        response = client.post("/site-status?adapter_type=iot", json=payload)
-
-    assert response.status_code == 422
-    assert response.json()["detail"][0]["loc"] == ["body", "node_availability"]
-
-
-def test_iot_adapter_does_not_accept_iot_as_ri_type(temp_database, monkeypatch):
-    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
-    payload = {
-        "site_id": "SLICES-GR-UTH",
-        "ri_type": "iot",
-        "timestamp": "2026-09-08T07:00:00Z",
-    }
-
-    with TestClient(app) as client:
-        response = client.post("/site-status?adapter_type=iot", json=payload)
-
-    assert response.status_code == 422
-    assert response.json()["detail"][0]["loc"] == ["body", "ri_type"]

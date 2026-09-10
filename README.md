@@ -351,7 +351,7 @@ Prediction responses include:
 - `site_status_forecast`: model-inferred availability/free capacity, queue/provisioning delay, maintenance flag, and operational state.
 - `capacity` and `feasibility`: broker-facing resource evidence derived from the inferred L2 forecast.
 
-Mock Site Adapter availability data is available for local tests:
+Local fixture availability data is available for validation tests:
 
 ```text
 raw_data/mock_site_profiles.json
@@ -370,51 +370,16 @@ Load it into the API database:
 docker compose exec api python scripts/load_mock_site_status.py
 ```
 
-Publish generic Site Adapter data directly:
-
-```bash
-curl -X POST "http://localhost:8000/site-profiles?adapter_type=iot" \
-  -H "Content-Type: application/json" \
-  -d '{"site_id":"SLICES-GR-UTH","ri_type":"network","location":"UTH","compute_capacity":32,"network_topology":"Mesh"}'
-
-curl -X POST "http://localhost:8000/site-status?adapter_type=openstack" \
-  -H "Content-Type: application/json" \
-  -d '{"site_id":"OPENSTACK-DEMO","timestamp":"2026-01-01T00:00:00Z","total_vcpus":256,"free_vcpus":120,"total_gpus":8,"free_gpus":2,"pending_vms":4,"vm_provisioning_delay_s":180}'
-```
-
-`adapter_type` only selects supported input aliases (`generic`, `iot`, or `openstack`); it does not classify the
-resource infrastructure. Use `ri_type` independently with one of `network`, `cloud`, or `grid` when the
-classification is known. The submission endpoints validate the full batch before writing, return HTTP 422 with
-field-specific errors for invalid values or conflicting aliases, and preserve unmapped fields in `extensions` with
-submission warnings.
-
-### Built-in mock L3 Site Adapter
-
-The mock L3 adapter is built into the same FastAPI API container. You do not need a separate L3 container, process, broker, OpenStack monitor, or IoT monitor for the MVP validation flow.
+Publish L2 Site Adapter snapshots directly:
 
 What must be running:
 
 - the `api` service from `docker compose up --build -d api`;
 - Postgres from the same Compose stack;
 - Nginx only if you want public HTTP on port `80`;
-- an allowed email in `allowed_emails.txt` with `site_admin` for the site you want to register.
+- an allowed email in `allowed_emails.txt` with `publisher` or `site_admin` for the site that will submit telemetry.
 
-The mock L3 endpoints are public for inspection through Nginx:
-
-```bash
-curl http://localhost/mock-l3/sites/SLICES-GR-UTH/capabilities
-curl http://localhost/mock-l3/sites/SLICES-GR-UTH/availability
-curl "http://localhost/mock-l3/sites/SLICES-GR-UTH/usage?start=2026-06-30T00:00:00Z&end=2026-07-01T00:00:00Z&step=1h"
-curl "http://localhost/mock-l3/sites/SLICES-GR-UTH/efficiency?start=2026-06-30T00:00:00Z&end=2026-07-01T00:00:00Z"
-```
-
-When registering a site, use the internal API URL as `adapter_base_url` because the L2 client runs inside the API container:
-
-```text
-http://127.0.0.1:8000/mock-l3/sites/SLICES-GR-UTH
-```
-
-Get a `site_admin` token:
+Get a publisher or site-admin token:
 
 ```bash
 TOKEN=$(curl -s -X POST http://localhost/auth/token \
@@ -423,42 +388,33 @@ TOKEN=$(curl -s -X POST http://localhost/auth/token \
     "email": "greendigit@uth.gr",
     "password": "your-password",
     "site_id": "SLICES-GR-UTH",
-    "role": "site_admin"
+    "role": "publisher"
   }' | jq -r '.access_token')
 ```
 
-Register an L2 site against the built-in mock L3 adapter:
+Submit a snapshot. The first accepted snapshot automatically creates the site record:
 
 ```bash
-curl -X POST http://localhost/l2/sites/register \
+curl -X POST http://localhost/l2/sites/SLICES-GR-UTH/snapshots \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "site_id": "SLICES-GR-UTH",
-    "site_name": "SLICES-GR-UTH",
+    "timestamp": "2026-09-08T07:00:00Z",
     "ri_type": "grid",
-    "adapter_base_url": "http://127.0.0.1:8000/mock-l3/sites/SLICES-GR-UTH",
-    "contact_email": "greendigit@uth.gr",
-    "auth_type": "jwt",
-    "metadata": {
-      "eimps_site_name": "SLICES-GR-UTH",
-      "execution_records_site_id": "site_e726c7cce5"
-    }
+    "operational_status": "UP",
+    "node_availability": 1.0,
+    "link_availability": 1.0,
+    "free_cpu_capacity": 32,
+    "queue_length": 0,
+    "load_index": 0.2
   }'
 ```
 
-For L2 Site Adapter registration, `ri_type` is one of `cloud`, `network`, or `grid`. EIMPS/MetricsDB connection is optional and not yet available in the operator UI, so registration no longer requires a matching execution-record site ID. If an execution-record mapping is known, it can still be kept in `metadata.execution_records_site_id` for prediction ID resolution. The current seeded local execution-record site IDs can be checked with:
+The current seeded local execution-record site IDs can be checked with:
 
 ```bash
 docker compose exec postgres psql -U m3l2 -d m3l2 \
   -c "SELECT site_id, count(*) FROM execution_records GROUP BY site_id ORDER BY count(*) DESC LIMIT 20;"
-```
-
-Pull from the mock L3 adapter into L2DB:
-
-```bash
-curl -X POST http://localhost/l2/sites/SLICES-GR-UTH/pull \
-  -H "Authorization: Bearer $TOKEN"
 ```
 
 Read the stored snapshot:

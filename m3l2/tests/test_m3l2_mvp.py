@@ -21,7 +21,6 @@ from m3l2.app.db import (
     utc_now,
 )
 from m3l2.app.main import app
-from m3l2.app.schemas import PredictRequest
 from m3l2.inference.predict import predict
 from m3l2.site_adapter.auth import create_site_jwt
 from m3l2.training.train import train_model
@@ -368,52 +367,3 @@ def test_successful_batch_prediction(temp_database, monkeypatch, tmp_path):
 
     assert response.status_code == 200
     assert [item["request_id"] for item in response.json()] == ["req-batch-a", "req-batch-b"]
-
-
-def test_mock_broker_maps_typed_workload(monkeypatch, temp_database):
-    import m3l2.broker_mock.router as broker_router
-
-    captured: dict[str, Any] = {}
-
-    def fake_predict(request: PredictRequest) -> dict[str, Any]:
-        captured["request"] = request
-        return {
-            "status": "ok",
-            "predictions": [
-                {
-                    "site_id": "site-a",
-                    "forecast": [{"ts": "2026-12-01T01:00:00Z", "value": 1.0, "unit": "Wh"}],
-                    "latest_site_status": {"availability": {"status": "up"}},
-                }
-            ],
-        }
-
-    async def fake_forward(session, site_id, payload):
-        captured["forward"] = {"site_id": site_id, "payload": payload}
-        return {"status": "submitted"}
-
-    monkeypatch.setenv("M3L2_ENABLE_SCHEDULER", "false")
-    monkeypatch.setattr(broker_router, "run_predict", fake_predict)
-    monkeypatch.setattr(broker_router, "forward_workload_to_site", fake_forward)
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/mock-broker/submit",
-            json={
-                "workload_id": "mock-1",
-                "workload_type": "batch",
-                "candidate_sites": ["site-a"],
-                "duration": "1h",
-                "requirements": {"cpu_cores": 4, "memory_gb": 8, "gpu_count": 1},
-                "metadata": {"team": "wp6"},
-                "extensions": {"application": "demo"},
-            },
-        )
-
-    assert response.status_code == 200
-    request = captured["request"]
-    assert request.workload.workload_id == "mock-1"
-    assert request.workload.resource_requirements.cpu == 4
-    assert request.workload.resource_requirements.gpu == 1
-    assert request.workload.time_requirements.duration == "1h"
-    assert captured["forward"]["payload"]["extensions"] == {"application": "demo"}

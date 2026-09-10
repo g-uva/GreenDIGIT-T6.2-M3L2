@@ -108,7 +108,7 @@ def post_json(url: str, token: str, payload: dict) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Submit generated mock L2 site snapshots.")
     parser.add_argument("--base-url", default="http://localhost:8000")
-    parser.add_argument("--site-id", default="SLICES-GR-UTH")
+    parser.add_argument("--site-id", default="SARA-MATRIX")
     parser.add_argument("--start", default=None, help="UTC start timestamp, default: today at 00:00 UTC")
     parser.add_argument("--days", type=int, default=365)
     parser.add_argument("--step-minutes", type=int, default=60)

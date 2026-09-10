@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -387,15 +387,27 @@ def _token_login_html(role: str = "reader") -> HTMLResponse:
             <img src="/static/cropped-GD_logo.png" alt="GreenDIGIT" class="auth-logo">
             <h1>GreenDIGIT M3L2 API</h1>
             <h2>Get token</h2>
-            <form method="post" action="/auth/login/token">
-                <input name="email" type="email" placeholder="Email" autocomplete="email" required>
-                <input name="password" type="password" placeholder="Password" autocomplete="current-password" required>
-                <input name="site_id" type="text" placeholder="Site ID, e.g. UTH-IOT">
-                <select name="role">
+            <form id="token-form">
+                <input id="token-email" type="email" placeholder="Email" autocomplete="email" required>
+                <input id="token-password" type="password" placeholder="Password" autocomplete="current-password" required>
+                <input id="token-site-id" type="text" placeholder="Site ID, e.g. UTH-IOT">
+                <select id="token-role">
                     __ROLE_OPTIONS__
                 </select>
                 <button type="submit">Get token</button>
             </form>
+            <p id="error" class="error" hidden></p>
+            <section id="token-result" hidden>
+                <p class="muted">Use this token as <code>Authorization: Bearer &lt;token&gt;</code>. It expires in 24 hours.</p>
+                <dl class="token-meta">
+                    <div><dt>Email</dt><dd id="result-email">-</dd></div>
+                    <div><dt>Site</dt><dd id="result-site">-</dd></div>
+                    <div><dt>Role</dt><dd id="result-role">-</dd></div>
+                </dl>
+                <label class="token-label" for="access-token">Access Token</label>
+                <textarea id="access-token" readonly></textarea>
+                <button type="button" id="copy-token">Copy Token</button>
+            </section>
             <div class="button-row">
                 <a class="button-link secondary" href="/auth/login?next=/ops/config/ui&role=site_admin">Login to config</a>
                 <a class="button-link secondary" href="/docs">Open API Docs</a>
@@ -409,6 +421,48 @@ def _token_login_html(role: str = "reader") -> HTMLResponse:
             </footer>
         </section>
     </main>
+    <script>
+        const form = document.getElementById("token-form");
+        const error = document.getElementById("error");
+        const result = document.getElementById("token-result");
+        form.addEventListener("submit", async (event) => {
+            event.preventDefault();
+            error.hidden = true;
+            const payload = {
+                email: document.getElementById("token-email").value.trim(),
+                password: document.getElementById("token-password").value,
+                site_id: document.getElementById("token-site-id").value.trim() || null,
+                role: document.getElementById("token-role").value,
+            };
+            const response = await fetch("/auth/token", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify(payload),
+            });
+            const bodyText = await response.text();
+            if (!response.ok) {
+                try {
+                    const body = JSON.parse(bodyText);
+                    error.textContent = body.detail || "Login failed";
+                } catch {
+                    error.textContent = "Login failed";
+                }
+                error.hidden = false;
+                return;
+            }
+            const body = JSON.parse(bodyText);
+            localStorage.setItem("m3l2_token", body.access_token);
+            localStorage.setItem("m3l2_principal", JSON.stringify({email: body.email, site_id: body.site_id, role: body.role}));
+            document.getElementById("result-email").textContent = body.email;
+            document.getElementById("result-site").textContent = body.site_id;
+            document.getElementById("result-role").textContent = body.role;
+            document.getElementById("access-token").value = body.access_token;
+            result.hidden = false;
+        });
+        document.getElementById("copy-token").addEventListener("click", () => {
+            navigator.clipboard.writeText(document.getElementById("access-token").value);
+        });
+    </script>
 </body>
 </html>"""
     return HTMLResponse(page.replace("__ROLE_OPTIONS__", role_options))
@@ -424,18 +478,6 @@ def login_page(next: str | None = Query(None), role: str = Query("site_admin")) 
 @router.get("/login/token", response_class=HTMLResponse, summary="HTML login page that displays a 24-hour JWT")
 def token_login_page(role: str = Query("reader")) -> HTMLResponse:
     return _token_login_html(role)
-
-
-@router.post("/login/token", response_class=HTMLResponse, summary="Login and display a 24-hour JWT")
-async def token_login(request: Request, session: Session = Depends(get_db)) -> HTMLResponse:
-    form = await request.form()
-    token_request = TokenRequest(
-        email=str(form.get("email") or ""),
-        password=str(form.get("password") or ""),
-        site_id=str(form.get("site_id") or "") or None,
-        role=str(form.get("role") or "reader"),
-    )
-    return _token_result_html(_issue_token(session, token_request))
 
 
 @router.post("/login", response_class=HTMLResponse, summary="Login and display a 24-hour JWT")

@@ -14,7 +14,8 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     volumes:
       - ./artifacts:/app/artifacts
   postgres:
@@ -23,6 +24,11 @@ services:
       POSTGRES_DB: m3l2
       POSTGRES_USER: m3l2
       POSTGRES_PASSWORD: m3l2
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U m3l2 -d m3l2"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
     ports:
       - "5433:5432"
     volumes:
